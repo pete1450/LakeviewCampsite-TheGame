@@ -6,7 +6,7 @@ A campground simulator in a single HTML file. Three.js, 45° isometric voxel vie
 
 ## The game
 
-You start with **$12,000** on a random 36×36 plot (1–3 lakes, tree clusters) with a paved entrance road from the south. Build dirt/gravel/asphalt roads, clear trees, and place 4 tiers of campsites (tent → popup → medium → big RV; smaller rigs fit bigger sites). Set nightly prices, add picnic tables and 3-tier firepits, build an expandable pool, bathrooms, a camp store, and a playground. Campers drive in with rig-matched vehicles, hunt for a site that fits their rig and budget, stay 1–4 nights, pay at midnight, and leave star ratings that drive future traffic.
+You start with **$1,000** on a random 36×36 plot (1–3 lakes, tree clusters) with a paved entrance road from the south. Build dirt/gravel/asphalt roads, clear trees, and place 4 tiers of campsites (tent → popup → medium → big RV; smaller rigs fit bigger sites). Set nightly prices, add picnic tables and 3-tier firepits, build an expandable pool, bathrooms, a camp store, and a playground. Campers drive in with rig-matched vehicles, hunt for a site that fits their rig and budget, stay 1–4 nights, pay at midnight, and leave star ratings that drive future traffic.
 
 Full mechanics documentation: [HOW_TO_PLAY.md](HOW_TO_PLAY.md)
 
