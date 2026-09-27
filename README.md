@@ -1,6 +1,6 @@
 # Lakeview Campsite — The Game
 
-**CAMPGROUND TYCOON** — a RollerCoaster-Tycoon-style campground simulator in a single HTML file. Three.js, 45° isometric voxel view, phone-friendly tap controls.
+A campground simulator in a single HTML file. Three.js, 45° isometric voxel view, phone-friendly tap controls.
 
 **Play it:** open `index.html` (or enable GitHub Pages on `main` — see below).
 
