@@ -2,7 +2,7 @@
 
 A campground simulator in a single HTML file. Three.js, 45° isometric voxel view, phone-friendly tap controls.
 
-**Play it:** open `index.html` (or enable GitHub Pages on `main` — see below).
+**Play it:** open `index.html`
 
 ## The game
 
@@ -32,7 +32,3 @@ node test_logic.js   # rules/economy tests
 node test_sim.js     # headless playthrough
 python3 build.py ../index.html
 ```
-
-## GitHub Pages
-
-Settings → Pages → Deploy from branch → `main` / root. The game is then live at `https://<user>.github.io/LakeviewCampsite-TheGame/`.
