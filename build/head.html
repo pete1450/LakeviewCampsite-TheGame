@@ -19,8 +19,22 @@
   .sbtn{background:rgba(10,25,10,.72);border:2px solid #d8f3c0;border-radius:10px;color:#fff;
     font-size:16px;min-width:44px;height:40px;cursor:pointer;font-family:inherit;font-weight:bold;}
   .sbtn.on{background:#3f7a2e;border-color:#fff;}
-  #muteBtn{pointer-events:auto;background:rgba(10,25,10,.72);border:2px solid #d8f3c0;border-radius:10px;
+  #muteBtn,#dbgBtn{pointer-events:auto;background:rgba(10,25,10,.72);border:2px solid #d8f3c0;border-radius:10px;
     color:#fff;font-size:16px;width:44px;height:40px;cursor:pointer;}
+  #dbgBtn.on{background:#3f7a2e;border-color:#fff;}
+  #dbgOverlay{position:absolute;inset:0;background:rgba(0,0,0,.55);display:none;pointer-events:auto;z-index:20;}
+  #dbgDialog{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:330px;max-width:88vw;
+    max-height:82vh;display:flex;flex-direction:column;background:rgba(12,26,12,.97);
+    border:3px solid #ffe14d;border-radius:12px;color:#fff;padding:12px;text-shadow:1px 1px 0 #000;}
+  #dbgDialog h3{margin:0 0 6px;font-size:16px;color:#ffe14d;}
+  #dbgBody{overflow-y:auto;font-size:13px;line-height:1.5;min-height:120px;}
+  #dbgBody .row{display:flex;justify-content:space-between;gap:8px;margin:2px 0;}
+  #dbgBody .row b{text-align:right;}
+  #dbgBody .sec{color:#ffe14d;font-weight:bold;margin:8px 0 2px;border-bottom:1px solid #3f7a2e;}
+  #dbgFoot{display:flex;align-items:center;justify-content:space-between;margin-top:10px;}
+  #dbgFoot .pbtn{background:#3f7a2e;border:2px solid #fff;color:#fff;border-radius:8px;font-family:inherit;
+    font-size:14px;font-weight:bold;padding:6px 10px;cursor:pointer;min-width:40px;}
+  #dbgFoot .pbtn:disabled{opacity:.4;cursor:default;}
   #toolbar{position:absolute;left:0;right:0;bottom:0;display:flex;gap:6px;padding:8px;
     overflow-x:auto;pointer-events:auto;background:rgba(8,18,8,.78);border-top:2px solid #d8f3c0;
     scrollbar-width:none;}
@@ -52,15 +66,18 @@
 <canvas id="cv"></canvas>
 <div id="ui">
   <div id="topbar">
-    <div class="stat"><small>CASH</small>💰 <span id="money">$12,000</span></div>
+    <div class="stat"><small>CASH</small>💰 <span id="money">$1,000</span></div>
     <div class="stat"><small>DAY</small>📅 <span id="day">1</span></div>
     <div class="stat"><small>GUESTS</small>🏕️ <span id="guests">0</span></div>
     <div class="stat"><small>RATING</small>⭐ <span id="stars">3.0</span></div>
     <div id="spdBox">
+      <button class="sbtn" id="rotBtn" title="rotate view">⟳</button>
+      <button class="sbtn" id="restartBtn" title="restart campground">↺</button>
       <button class="sbtn" id="spd0" title="pause">⏸</button>
       <button class="sbtn on" id="spd1" title="normal speed">▶</button>
       <button class="sbtn" id="spd2" title="fast">⏩</button>
       <button id="muteBtn" title="mute">🔊</button>
+      <button id="dbgBtn" title="debug: departure reports">🐛</button>
     </div>
   </div>
   <div id="toolbar">
@@ -72,9 +89,11 @@
     <button class="tool" id="tool-medium"><span class="em">🚚</span>Medium<span class="ct">$600</span></button>
     <button class="tool" id="tool-rv"><span class="em">🏕️</span>RV<span class="ct">$1000</span></button>
     <button class="tool" id="tool-pool"><span class="em">🏊</span>Pool<span class="ct">$900</span></button>
+    <button class="tool" id="tool-lake"><span class="em">🌊</span>Lake<span class="ct">$30</span></button>
     <button class="tool" id="tool-bathroom"><span class="em">🚻</span>Bathroom<span class="ct">$550</span></button>
     <button class="tool" id="tool-store"><span class="em">🏪</span>Store<span class="ct">$1400</span></button>
     <button class="tool" id="tool-playground"><span class="em">🛝</span>Playgrnd<span class="ct">$750</span></button>
+    <button class="tool" id="tool-dock"><span class="em">🎣</span>Dock<span class="ct">$1000</span></button>
     <button class="tool" id="tool-bulldoze"><span class="em">💥</span>Raze<span class="ct">50%</span></button>
   </div>
   <div id="panel">
@@ -87,12 +106,24 @@
       <b id="pPriceVal">$25</b>
       <button class="pbtn" id="pPriceUp">+</button></span>
     </div>
-    <button class="pbtn wide" id="pTableBtn" style="display:none">Add picnic table ($60)</button>
+    <button class="pbtn wide" id="pTableBtn" style="display:none">Add picnic table ($120)</button>
     <button class="pbtn wide" id="pFireBtn" style="display:none">Firepit: none</button>
     <button class="pbtn wide" id="pExpandBtn" style="display:none">Expand pool ($700)</button>
   </div>
   <div id="toast"></div>
-  <div id="hint">tap a tool, then tap the map &nbsp;•&nbsp; drag = pan &nbsp;•&nbsp; pinch/wheel = zoom &nbsp;•&nbsp; v2026.09.26b</div>
+  <div id="dbgOverlay">
+    <div id="dbgDialog">
+      <h3>🐛 Departure report</h3>
+      <div id="dbgBody"></div>
+      <div id="dbgFoot">
+        <button class="pbtn" id="dbgPrev">◀</button>
+        <span id="dbgPage">1 of 1</span>
+        <button class="pbtn" id="dbgNext">▶</button>
+        <button class="pbtn" id="dbgClose">✕</button>
+      </div>
+    </div>
+  </div>
+  <div id="hint">tap a tool, then tap the map &nbsp;•&nbsp; drag = pan &nbsp;•&nbsp; pinch/wheel = zoom &nbsp;•&nbsp; ⟳ = rotate &nbsp;•&nbsp; v2026.09.26j</div>
 </div>
 <script>
 

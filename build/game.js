@@ -9,8 +9,15 @@ const lerp = (a,b,t)=>a+(b-a)*t;
 const TAU = Math.PI*2;
 const PX = 3; // render at 1/3 resolution, upscale with pixelated CSS
 
-let renderer, scene, camera, camTarget;
+let renderer, scene, camera, camTarget, sunLight=null, hemiLight=null, bgCol=null;
 let viewH = 34, viewAspect = 1;
+let camRot = 0; // 0..3, 90° stops
+let glowSprites = new Map(); // structId -> {sprite, phase, base}
+let glowTex = null;
+let stars = null;
+let restartArmedAt = -1e9;
+let restartBtnEl = null;
+let saveAcc = 0;
 let _ray=null, _ndc=null, _plane=null;
 const wx = gx=>gx - W/2 + 0.5;
 const wz = gy=>gy - H/2 + 0.5;
@@ -26,6 +33,17 @@ let shimmerQuads = [];
 let fireMeshes = [];
 let peopleGroups = new Map(); // structId -> Group
 let ghost = null, ghostTile = null, ghostOk = false;
+let radiusGroup = null, radiusPinned = false; // amenity effective-radius circle
+// radius shown while placing (level-0); inspecting uses radiusFor(st) for the live level
+const TOOL_BASE_R = {bathroom:BATH_R, pool:5, playground:PLAY_R, dock:7};
+function radiusFor(st){
+  if(!st) return 0;
+  if(st.kind==='bathroom') return BATH_R;
+  if(st.kind==='playground') return PLAY_R;
+  if(st.kind==='pool') return poolRadius(st);
+  if(st.kind==='dock') return dockRadius(st);
+  return 0;
+}
 let frameNo = 0;
 
 /* ---------------- material / geometry caches ---------------- */
@@ -90,16 +108,30 @@ function bootThree(){
   renderer = new THREE.WebGLRenderer({canvas: el('cv'), antialias:false});
   renderer.setPixelRatio(1);
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x87b5e0);
+  bgCol = new THREE.Color(0x87b5e0);
+  scene.background = bgCol;
   camera = new THREE.OrthographicCamera(-1,1,1,-1,0.1,400);
-  scene.add(new THREE.HemisphereLight(0xeaf4ff, 0x3a5a34, 0.95));
-  const sun = new THREE.DirectionalLight(0xfff2d8, 0.85);
-  sun.position.set(30,48,18); scene.add(sun);
+  hemiLight = new THREE.HemisphereLight(0xeaf4ff, 0x3a5a34, 0.95);
+  scene.add(hemiLight);
+  sunLight = new THREE.DirectionalLight(0xfff2d8, 0.85);
+  sunLight.position.set(30,48,18); scene.add(sunLight);
+  scene.fog = new THREE.Fog(0x87b5e0, 80, 220);
+  buildStars();
   const under = new THREE.Mesh(new THREE.PlaneGeometry(600,600), mat(0x5a7a4a));
   under.rotation.x = -Math.PI/2; under.position.y = -0.5; scene.add(under);
   ghost = new THREE.Mesh(boxGeo(1,0.22,1),
     new THREE.MeshBasicMaterial({color:0x00ff00, transparent:true, opacity:0.35, depthWrite:false}));
   ghost.visible = false; scene.add(ghost);
+  // translucent circle showing an amenity's effective radius
+  radiusGroup = new THREE.Group();
+  const rFill = new THREE.Mesh(new THREE.CircleGeometry(1,48),
+    new THREE.MeshBasicMaterial({color:0x7fd4ff, transparent:true, opacity:0.22, depthWrite:false}));
+  rFill.rotation.x=-Math.PI/2;
+  const rEdge = new THREE.Mesh(new THREE.RingGeometry(0.96,1,64),
+    new THREE.MeshBasicMaterial({color:0x9fe2ff, transparent:true, opacity:0.85, depthWrite:false}));
+  rEdge.rotation.x=-Math.PI/2;
+  radiusGroup.add(rFill,rEdge);
+  radiusGroup.position.y=0.06; radiusGroup.visible=false; scene.add(radiusGroup);
   resize();
   window.addEventListener('resize', resize);
 }
@@ -113,14 +145,17 @@ function resize(){
   positionCamera();
 }
 function positionCamera(){
-  const d=90;
-  camera.position.set(camTarget.x+d*0.577, camTarget.y+d*0.577, camTarget.z+d*0.577);
+  const d=90, e=Math.asin(1/Math.sqrt(3)), az=Math.PI/4+camRot*Math.PI/2, ce=Math.cos(e);
+  camera.position.set(camTarget.x+d*ce*Math.cos(az), camTarget.y+d*Math.sin(e), camTarget.z+d*ce*Math.sin(az));
   camera.lookAt(camTarget);
 }
+function rotateCam(){ camRot=(camRot+1)%4; positionCamera(); sClick(); }
 function panCam(rx, uy){
-  const s=Math.SQRT1_2;
-  camTarget.x=clamp(camTarget.x+(rx*s - uy*s), -W/2-8, W/2+8);
-  camTarget.z=clamp(camTarget.z+(-rx*s - uy*s), -H/2-8, H/2+8);
+  const az=Math.PI/4+camRot*Math.PI/2;
+  const rwx=Math.sin(az), rwz=-Math.cos(az);   // screen-right in world XZ
+  const uwx=-Math.cos(az), uwz=-Math.sin(az);  // screen-up in world XZ
+  camTarget.x=clamp(camTarget.x+rx*rwx+uy*uwx, -W/2-8, W/2+8);
+  camTarget.z=clamp(camTarget.z+rx*rwz+uy*uwz, -H/2-8, H/2+8);
   positionCamera();
 }
 function zoomBy(f){
@@ -204,9 +239,107 @@ function buildShimmer(){
     const q=new THREE.Mesh(boxGeo(0.5,0.02,0.18),
       new THREE.MeshBasicMaterial({color:0xdff2ff, transparent:true, opacity:0.5}));
     q.position.set(wx(x)+(i%3)*0.2-0.2, 0.02, wz(y));
-    q.userData={x, speed:0.25+((i*13)%10)/22};
+    q.userData={x, y, speed:0.25+((i*13)%10)/22};
     scene.add(q); shimmerQuads.push(q);
   }
+}
+function refreshShimmer(){
+  // rebuild the shimmer set so newly dug (or filled) lake tiles join it
+  for(const q of shimmerQuads) scene.remove(q);
+  buildShimmer();
+}
+/* ---------------- night: stars + campfire glow ---------------- */
+function buildStars(){
+  if(stars||!THREE.BufferGeometry||!THREE.Points) return;
+  const n=170, pos=new Float32Array(n*3);
+  for(let i=0;i<n;i++){
+    const a=Math.random()*TAU, r=70+Math.random()*140;
+    pos[i*3]=Math.cos(a)*r; pos[i*3+1]=34+Math.random()*110; pos[i*3+2]=Math.sin(a)*r;
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  const m=new THREE.PointsMaterial({color:0xffffff,size:1.6,sizeAttenuation:false,transparent:true,opacity:0,depthWrite:false});
+  stars=new THREE.Points(geo,m); scene.add(stars);
+}
+function makeGlowTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=128;
+  const ctx=c.getContext('2d');
+  const g=ctx.createRadialGradient(64,64,4,64,64,64);
+  g.addColorStop(0,'rgba(255,196,110,1)');
+  g.addColorStop(0.35,'rgba(255,140,50,0.55)');
+  g.addColorStop(1,'rgba(255,90,20,0)');
+  ctx.fillStyle=g; ctx.fillRect(0,0,128,128);
+  return new THREE.CanvasTexture(c);
+}
+function syncGlows(){
+  for(const [id,e] of glowSprites){
+    const st=structById(S,id);
+    const want=st&&((st.kind==='site'&&st.firepit>0)||st.kind==='store');
+    if(!want){ scene.remove(e.sprite); glowSprites.delete(id); }
+  }
+  if(!glowTex) glowTex=makeGlowTexture();
+  for(const st of S.structures){
+    if(glowSprites.has(st.id)) continue;
+    let x,z,scale,base;
+    if(st.kind==='site'&&st.firepit>0){
+      x=wx(st.x)+(st.w-1)/2+st.w/4; z=wz(st.y)+(st.h-1)/2+st.h/4;
+      scale=2.6+st.firepit*0.5; base=0.85;
+    }else if(st.kind==='store'){
+      x=wx(st.x)+(st.w-1)/2; z=wz(st.y)+(st.h-1)/2;
+      scale=3.2; base=0.3;
+    }else continue;
+    const m=new THREE.SpriteMaterial({map:glowTex,blending:THREE.AdditiveBlending,transparent:true,depthWrite:false,opacity:0});
+    const sp=new THREE.Sprite(m);
+    sp.position.set(x,1.0,z); sp.scale.set(scale,scale,1);
+    scene.add(sp);
+    glowSprites.set(st.id,{sprite:sp,phase:st.id*1.37,base});
+  }
+}
+/* floating emoji signs over bathroom/store */
+let signSprites = new Map(); // structId -> {sprite, baseY, phase}
+function makeTextSprite(text,size){
+  const c=document.createElement('canvas'); c.width=c.height=128;
+  const ctx=c.getContext('2d');
+  ctx.font='92px serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(text,64,70);
+  const sp=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:new THREE.CanvasTexture(c), transparent:true, depthWrite:false }));
+  sp.scale.set(size,size,1);
+  return sp;
+}
+function syncSigns(st){
+  const old=signSprites.get(st.id);
+  if(old){ scene.remove(old.sprite); signSprites.delete(st.id); }
+  if(st.kind!=='bathroom'&&st.kind!=='store') return;
+  const cx=wx(st.x)+(st.w-1)/2, cz=wz(st.y)+(st.h-1)/2;
+  const sp=makeTextSprite(st.kind==='bathroom'?'🚻':'🏪',1.5);
+  const baseY=st.kind==='bathroom'?2.3:2.7;
+  sp.position.set(cx,baseY,cz);
+  scene.add(sp);
+  signSprites.set(st.id,{sprite:sp,baseY,phase:st.id*2.13});
+}
+/* floating payment text (rises and fades) */
+let floaters=[]; // {sp, life, ttl}
+function makeFloatTexture(text,color){
+  const c=document.createElement('canvas'); c.width=256; c.height=96;
+  const ctx=c.getContext('2d');
+  ctx.font='bold 54px Verdana,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.lineWidth=8; ctx.strokeStyle='rgba(0,0,0,0.85)';
+  ctx.strokeText(text,128,48);
+  ctx.fillStyle=color; ctx.fillText(text,128,48);
+  return new THREE.CanvasTexture(c);
+}
+function spawnFloater(text,x,z,color){
+  const sp=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:makeFloatTexture(text,color), transparent:true, depthWrite:false }));
+  sp.scale.set(2.8,1.05,1); sp.position.set(x,1.8,z);
+  scene.add(sp);
+  floaters.push({sp,life:0,ttl:1.2});
+}
+function siteCenter(st){ return {x:wx(st.x)+(st.w-1)/2, z:wz(st.y)+(st.h-1)/2}; }
+function clearFloaters(){
+  for(const f of floaters) scene.remove(f.sp);
+  floaters=[];
 }
 const ROAD_COLORS={1:0x8a6238, 2:0x8f8f8f, 3:0x3a3a42};
 function syncRoadTile(x,y){
@@ -230,7 +363,7 @@ function syncAllRoads(){
 }
 
 /* ---------------- voxel builders ---------------- */
-function buildFirepit(g,cx,cz,tier){
+function buildFirepit(g,cx,cz,tier,structId){
   if(tier>=1) box(0.44,0.07,0.44,0x5a3a22,cx,0.1,cz,g); // dirt spot
   if(tier>=2){
     for(let i=0;i<4;i++){
@@ -247,7 +380,7 @@ function buildFirepit(g,cx,cz,tier){
   }
   if(tier>=1){
     const f=box(0.16,0.22,0.16,0xff7a1a,cx,0.22,cz,g,0xff4400);
-    fireMeshes.push(f);
+    fireMeshes.push({m:f, id:structId}); // flame lit only when the site is occupied
   }
 }
 function buildTable(g,cx,cz){
@@ -292,21 +425,22 @@ function buildRV(g,cx,cz,color){
   for(const [ox,oz] of [[-0.8,-0.5],[0.2,-0.5],[0.9,-0.5],[-0.8,0.5],[0.2,0.5],[0.9,0.5]])
     box(0.24,0.24,0.12,0x1e1e1e,cx+ox,0.14,cz+oz,g);
 }
-// rig parked ON a site (shown while camped)
+// rig parked ON a site (shown while camped). The pulling vehicle is gone —
+// only the camper itself stays: tent for tent sites, trailers for popup/medium,
+// the motorhome for the big RV.
 function buildRigOnSite(g,rig,cx,cz,w,h){
-  const ex=cx-w/2+0.6, ez=cz;
   if(rig===RIG_TENT){
     buildTent(g,cx,cz,0x3f7ac2);
-    buildCar(g,cx,cz+h/2-0.35,0xc23b2e);
+    g.userData.parkedRig='tent';
   }else if(rig===RIG_POPUP){
-    buildPickup(g,ex-0.5,ez,0x2e6bc2);
-    buildTrailer(g,ex+1.1,ez,1.2,0x2e6bc2,true);
-    buildTent(g,cx+0.3,cz-0.4,0x53a05a);
+    buildTrailer(g,cx,cz,1.2,0x53a05a,true);
+    g.userData.parkedRig='popup-trailer';
   }else if(rig===RIG_MEDIUM){
-    buildPickup(g,ex-0.7,ez,0x3a3a3a);
-    buildTrailer(g,ex+1.1,ez,1.8,0xd8d0c0,false);
+    buildTrailer(g,cx,cz,1.8,0x3f7ac2,false);
+    g.userData.parkedRig='medium-trailer';
   }else{
     buildRV(g,cx,cz,0xe8e0d0);
+    g.userData.parkedRig='rv';
   }
 }
 // vehicle driving on roads
@@ -331,7 +465,7 @@ function buildStructureMesh(st){
   if(st.kind==='site'){
     box(st.w*0.94,0.1,st.h*0.94,0xc9b083,cx,0.06,cz,g); // pad
     const fx=cx+st.w/4, fz=cz+st.h/4;
-    buildFirepit(g,fx,fz,st.firepit);
+    buildFirepit(g,fx,fz,st.firepit,st.id);
     if(st.table) buildTable(g,cx-st.w/4,cz-st.h/4);
     if(st.guestId>=0){
       const guest=S.guests.find(v=>v.id===st.guestId);
@@ -363,18 +497,40 @@ function buildStructureMesh(st){
       box(0.05,0.5,0.05,0xcccccc,cx+0.55+px,1.2,cz,g);
       box(0.24,0.06,0.24,0x8a5a2e,cx+0.55+px,0.92,cz,g);
     }
+  }else if(st.kind==='dock'){
+    box(2.0,0.12,2.0,0x8a5a2e,cx,0.12,cz,g); // deck
+    for(const px of [-0.9,0.9]) for(const pz of [-0.9,0.9])
+      box(0.14,0.7,0.14,0x5a3a1e,cx+px,-0.12,cz+pz,g); // pilings
+    box(2.0,0.1,0.1,0x6b4426,cx,0.42,cz-0.95,g); // railing
+    for(const px of [-0.9,0.9]) box(0.1,0.4,0.1,0x6b4426,cx+px,0.3,cz-0.95,g);
+    const dlv=st.level|0;
+    if(dlv>=1) for(const bx of [-0.5,0.5]){ // row boats
+      box(0.5,0.16,0.95,0x7a4a22,cx+bx,0.14,cz+0.45,g);
+      box(0.34,0.1,0.75,0x2e9fe8,cx+bx,0.16,cz+0.45,g);
+      box(0.36,0.06,0.12,0x8a5a2e,cx+bx,0.22,cz+0.45,g);
+    }
+    if(dlv>=2) for(const jx of [-0.55,0.55]){ // jetskis
+      box(0.42,0.18,0.85,0x22cc66,cx+jx,0.14,cz-0.5,g);
+      box(0.2,0.14,0.32,0x114422,cx+jx,0.26,cz-0.62,g);
+    }
   }
   g.userData.structId=st.id;
   scene.add(g);
   structGroups.set(st.id,g);
   // people for occupied sites
   syncPeople(st);
+  syncGlows();
+  syncSigns(st);
 }
 function removeStructureMesh(id){
   const g=structGroups.get(id);
   if(g){ scene.remove(g); structGroups.delete(id); }
   const p=peopleGroups.get(id);
   if(p){ scene.remove(p); peopleGroups.delete(id); }
+  const sg=signSprites.get(id);
+  if(sg){ scene.remove(sg.sprite); signSprites.delete(id); }
+  fireMeshes=fireMeshes.filter(f=>f.id!==id);
+  syncGlows();
 }
 function syncStructure(st){
   removeStructureMesh(st.id);
@@ -411,6 +567,11 @@ function rebuildWorld(){
   for(const [,g] of peopleGroups) scene.remove(g);
   peopleGroups.clear();
   for(const q of shimmerQuads) scene.remove(q);
+  for(const [,e] of glowSprites) scene.remove(e.sprite);
+  glowSprites.clear();
+  for(const [,sg] of signSprites) scene.remove(sg.sprite);
+  signSprites.clear();
+  clearFloaters();
   fireMeshes=[];
   buildGround();
   rebuildTrees();
@@ -423,7 +584,7 @@ function rebuildWorld(){
 
 /* ---------------- ghost highlight ---------------- */
 const TOOL_FOOT={select:[1,1],road:[1,1],clear:[1,1],tent:[1,1],popup:[2,2],medium:[2,3],rv:[3,3],
-  pool:[2,2],bathroom:[2,2],store:[3,2],playground:[2,2],bulldoze:[1,1]};
+  pool:[2,2],lake:[1,1],bathroom:[2,2],store:[3,2],playground:[2,2],dock:[2,2],bulldoze:[1,1]};
 function ghostValidity(x,y){
   const [w,h]=TOOL_FOOT[currentTool]||[1,1];
   if(currentTool==='select') return true;
@@ -435,6 +596,16 @@ function ghostValidity(x,y){
     return S.money>=(r===R_DIRT?COST.roadGravel:COST.roadAsphalt);
   }
   if(currentTool==='clear') return inB(x,y)&&S.terrain[idx(x,y)]===T_TREE&&S.money>=COST.clearTree;
+  if(currentTool==='lake'){
+    if(!inB(x,y)) return false;
+    const k=idx(x,y);
+    return S.terrain[k]===T_GRASS&&S.road[k]===R_NONE&&S.tileStruct[k]<0&&S.money>=COST.lake;
+  }
+  if(currentTool==='dock'){
+    if(!inB(x,y)) return false;
+    if(S.money<DOCK_DEF.cost) return false;
+    return dockSpotOk(S,x,y).ok;
+  }
   if(currentTool==='bulldoze'){
     if(!inB(x,y)) return false;
     const k=idx(x,y);
@@ -454,13 +625,20 @@ function ghostValidity(x,y){
   return footprintClear(S,x,y,w,h).ok && adjacentToRoad(S,x,y,w,h);
 }
 function updateGhost(x,y){
+  // radius preview for amenity tools (pinned panel circle is left alone)
+  const tr=TOOL_BASE_R[currentTool];
+  if(tr&&x!=null){
+    const [w,h]=TOOL_FOOT[currentTool]||[1,1];
+    showRadius(wx(x)+(w-1)/2, wz(y)+(h-1)/2, tr, false);
+  } else if(!radiusPinned) hideRadius();
   if(currentTool==='select'||!x){ ghost.visible=false; ghostTile=null; return; }
   ghostTile={x,y};
   const [w,h]=TOOL_FOOT[currentTool]||[1,1];
   ghostOk=ghostValidity(x,y);
   ghost.scale.set(w,1,h);
   ghost.position.set(wx(x)+(w-1)/2, 0.16, wz(y)+(h-1)/2);
-  ghost.material.color.setHex(ghostOk?0x2aff2a:0xff2a2a);
+  // lakes preview blue; everything else green/red
+  ghost.material.color.setHex(currentTool==='lake'?(ghostOk?0x2a7aff:0xff2a2a):(ghostOk?0x2aff2a:0xff2a2a));
   ghost.visible=true;
 }
 
@@ -504,16 +682,27 @@ function tapTile(x,y){
       r=placePool(S,x,y);
       if(r.ok){ const st=structById(S,r.id); buildStructureMesh(st); }
       return afterBuild(r);
+    case 'lake':
+      r=digLake(S,x,y);
+      if(r.ok){ refreshWaterTile(x,y); refreshShimmer(); }
+      return afterBuild(r);
+    case 'dock':
+      r=placeDock(S,x,y);
+      if(r.ok){ const st=structById(S,r.id); buildStructureMesh(st); }
+      return afterBuild(r);
     case 'bathroom': case 'store': case 'playground':
       r=placeBuilding(S,currentTool,x,y);
       if(r.ok){ const st=structById(S,r.id); buildStructureMesh(st); }
       return afterBuild(r);
     case 'bulldoze': {
       const id0=structAt(S,x,y);
+      const wasWater=S.terrain[idx(x,y)]===T_WATER;
       r=bulldoze(S,x,y);
       if(r.ok){
         if(r.id) removeStructureMesh(r.id);
         syncRoadTile(x,y);
+        refreshWaterTile(x,y); // lake fill shows grass again
+        if(wasWater) refreshShimmer(); // filled lakes leave the shimmer set
         if(curPanel>=0) closePanel();
       }
       return afterBuild(r,sRaze);
@@ -524,13 +713,36 @@ function tapTile(x,y){
 
 /* ---------------- panel ---------------- */
 const FIRE_NAMES=['none','dirt spot','wheel ring','fancy stone'];
+let panelOpenT=-1e9;
+function showRadius(cx,cz,r,pinned){
+  if(!radiusGroup) return;
+  radiusGroup.position.x=cx; radiusGroup.position.z=cz;
+  radiusGroup.scale.set(r,1,r);
+  radiusGroup.visible=true; radiusPinned=!!pinned;
+}
+function hideRadius(){
+  radiusPinned=false;
+  if(radiusGroup) radiusGroup.visible=false;
+}
 function openPanel(id){
   curPanel=id; renderPanel();
   el('panel').style.display='block';
+  panelOpenT=performance.now();
+  const st=structById(S,id), tr=radiusFor(st);
+  if(tr) showRadius(wx(st.x)+(st.w-1)/2, wz(st.y)+(st.h-1)/2, tr, true);
+  else hideRadius();
+}
+// The tap that opens the panel can land on a button the panel just revealed;
+// swallow clicks that arrive within 500ms of the panel opening.
+function guardPanelTap(e){
+  if(performance.now()-panelOpenT<500){
+    e.preventDefault(); e.stopImmediatePropagation();
+  }
 }
 function closePanel(){
   curPanel=-1;
   el('panel').style.display='none';
+  hideRadius();
 }
 function renderPanel(){
   const st=structById(S,curPanel);
@@ -551,7 +763,7 @@ function renderPanel(){
     show('priceRow',true);
     el('pPriceVal').textContent='$'+st.price;
     const tb=el('pTableBtn');
-    tb.textContent=st.table?'✓ Picnic table':'Add picnic table ($60)';
+    tb.textContent=st.table?'✓ Picnic table':'Add picnic table ($120)';
     tb.disabled=st.table||S.money<COST.table;
     show('pTableBtn',true);
     const fb=el('pFireBtn');
@@ -561,19 +773,37 @@ function renderPanel(){
     fb.disabled=st.firepit>=3||S.money<COST.firepit[nt];
     show('pFireBtn',true);
   }else if(st.kind==='pool'){
+    const plv=st.level|0;
     el('panelTitle').textContent='🏊 Pool';
-    body.textContent=(st.expanded?'3x3':'2x2')+' pool • +happiness for all guests';
-    show('pExpandBtn',!st.expanded);
-    el('pExpandBtn').disabled=S.money<POOL_DEF.expandCost;
+    body.textContent=(['2x2','3x3','4x4'][plv]||'2x2')+' pool • +2 happiness within '+poolRadius(st)+' tiles';
+    const pnx=POOL_LEVELS[plv+1];
+    show('pExpandBtn',!!pnx);
+    if(pnx){
+      el('pExpandBtn').textContent='Expand pool ($'+pnx.cost.toLocaleString('en-US')+')';
+      el('pExpandBtn').disabled=S.money<pnx.cost;
+    }
+  }else if(st.kind==='dock'){
+    const dlv=st.level|0;
+    el('panelTitle').textContent='🎣 Fishing dock';
+    body.textContent=['+1 happiness within 7 tiles','+1 happiness within 9 tiles • row boats','+1 happiness within 11 tiles • jetskis'][dlv]||'';
+    const dnx=DOCK_LEVELS[dlv+1];
+    show('pExpandBtn',!!dnx);
+    if(dnx){
+      el('pExpandBtn').textContent=(dlv===0?'Add row boats ($1,500)':'Add jetskis ($2,000)');
+      el('pExpandBtn').disabled=S.money<dnx.cost;
+    }
   }else{
     const nm={bathroom:'🚻 Bathroom',store:'🏪 Camp store',playground:'🛝 Playground'}[st.kind];
     el('panelTitle').textContent=nm;
     body.textContent={
-      bathroom:'Guests nearby are happier.',
-      store:'Earns $4 per guest, per night.',
-      playground:'Big happiness boost for tent & popup families.',
+      bathroom:'Guests within 8 tiles are happier.',
+      store:'Earns $8 per guest, per night.',
+      playground:'Big happiness boost for tent & popup families within 10 tiles.',
     }[st.kind];
   }
+  // keep the radius circle in sync (e.g. pool expansion changes the footprint)
+  const tr2=radiusFor(st);
+  if(tr2) showRadius(wx(st.x)+(st.w-1)/2, wz(st.y)+(st.h-1)/2, tr2, true);
 }
 function rigsFor(cap){
   return ['tent','tent+popup','tent..medium','all rigs'][cap];
@@ -587,7 +817,7 @@ function panelAction(act){
   else if(act==='table') r=buyTable(S,st.id);
   else if(act==='fire') r=buyFirepit(S,st.id);
   else if(act==='expand'){
-    r=expandPool(S,st.id);
+    r=(st.kind==='dock')?upgradeDock(S,st.id):expandPool(S,st.id);
     if(r.ok) syncStructure(st);
   }
   if(!r) return false;
@@ -609,29 +839,141 @@ function updateHUD(){
   el('day').textContent=S.day;
   el('guests').textContent=occupiedCount(S);
   el('stars').textContent=S.rating.toFixed(1);
-  for(const [id,v] of [['spd0',0],['spd1',1],['spd2',2]])
+  for(const [id,v] of [['spd0',0],['spd1',1],['spd2',5.4]])
     el(id).className='sbtn'+(S.speed===v?' on':'');
 }
 function setSpeed(v){
   S.speed=v; updateHUD(); sClick();
 }
 
+/* ---------------- persistence (silent autosave) ---------------- */
+const SAVE_KEY='campground-tycoon-save-v1';
+function saveGame(){
+  if(!S) return;
+  try{ localStorage.setItem(SAVE_KEY, saveState(S)); }catch(e){}
+}
+function loadGame(){
+  try{
+    const raw=localStorage.getItem(SAVE_KEY);
+    if(!raw) return null;
+    return loadState(raw);
+  }catch(e){ return null; }
+}
+function reloadSave(){
+  const s2=loadGame();
+  if(s2){ S=s2; rebuildWorld(); closePanel(); updateHUD(); }
+  return !!s2;
+}
+/* ---------------- restart (two-tap SURE? confirm) ---------------- */
+function tapRestart(){
+  const nowMs=performance.now();
+  if(nowMs-restartArmedAt<3000){
+    restartArmedAt=-1e9;
+    if(restartBtnEl) restartBtnEl.textContent='↺';
+    try{ localStorage.removeItem(SAVE_KEY); }catch(e){}
+    closeDbg(); // dismiss any departure reports from the old park
+    startSeed((Date.now()%100000)|0);
+    saveAcc=0;
+    toast('Fresh campground — good luck!');
+    sChime();
+  }else{
+    restartArmedAt=nowMs;
+    if(restartBtnEl) restartBtnEl.textContent='SURE?';
+    sClick();
+  }
+}
+
 /* ---------------- events from sim ---------------- */
 const VEH_COLORS=[0xc23b2e,0x2e6bc2,0x53a05a,0xe8a13c,0x8a4fc2,0x3a9a9a];
 function drainEvents(evs){
   for(const e of evs){
-    if(e.t==='turnedAway'){ sHonk(); }
+    if(e.t==='turnedAway'){ sHonk(); if(debugMode) dbgPush(dbgTurnHtml(e)); }
     else if(e.t==='arrive'){ sArrive(); const st=structById(S,e.siteId); if(st) syncStructure(st); }
-    else if(e.t==='paid'){ sCash(); }
+    else if(e.t==='paid'){
+      sCash();
+      const g=S.guests.find(v=>v.id===e.guestId);
+      const st=g&&structById(S,g.siteId);
+      if(st){ const c=siteCenter(st); spawnFloater('$'+e.amount,c.x,c.z,'#7dff7d'); }
+    }
     else if(e.t==='depart'){
       const st=structById(S,e.siteId);
       if(st) syncStructure(st);
-      if(e.tip>0) toast('⭐ '+e.stars+'-star stay! Tip +$'+e.tip);
+      if(e.tip>0){
+        toast('⭐ '+e.stars+'-star stay! Tip +$'+e.tip);
+        if(st){ const c=siteCenter(st); spawnFloater('+$'+e.tip+' tip',c.x,c.z,'#ffd24d'); }
+      }
+      if(debugMode&&e.report) dbgPush(dbgStayHtml(e.report));
     }
     else if(e.t==='midnight'){ sChime(); }
     else if(e.t==='storeRev'){ /* cash sound already via paid */ }
   }
   if(evs.length) updateHUD();
+}
+
+/* ---------------- debug departure dialog ---------------- */
+let debugMode=false, dbgQueue=[], dbgIdx=0, dbgPaused=false, dbgPrevSpeed=1;
+function toggleDebug(){
+  debugMode=!debugMode;
+  el('dbgBtn').className=debugMode?'on':'';
+  if(!debugMode) closeDbg();
+  const tb=el('mgTestBar'); if(tb) tb.style.display=debugMode?'flex':'none';
+  toast(debugMode?'🐛 departure reports ON':'🐛 departure reports OFF');
+}
+function dbgPush(html){
+  dbgQueue.push(html);
+  if(el('dbgOverlay').style.display==='block') renderDbg();
+  else {
+    dbgIdx=0;
+    // auto-pause for the report; remember speed so dismiss can resume
+    dbgPaused=S.speed!==0;
+    if(dbgPaused){ dbgPrevSpeed=S.speed; setSpeed(0); }
+    renderDbg(); el('dbgOverlay').style.display='block';
+  }
+}
+function renderDbg(){
+  const n=dbgQueue.length;
+  if(!n){ el('dbgOverlay').style.display='none'; return; }
+  dbgIdx=Math.max(0,Math.min(dbgIdx,n-1));
+  el('dbgBody').innerHTML=dbgQueue[dbgIdx];
+  el('dbgPage').textContent=(dbgIdx+1)+' of '+n;
+  el('dbgPrev').disabled=dbgIdx<=0;
+  el('dbgNext').disabled=dbgIdx>=n-1;
+}
+function closeDbg(){
+  dbgQueue=[]; dbgIdx=0; el('dbgOverlay').style.display='none';
+  // resume only if we auto-paused and the user didn't touch speed meanwhile
+  if(dbgPaused&&S.speed===0) setSpeed(dbgPrevSpeed);
+  dbgPaused=false;
+}
+function dbgRow(k,v){ return '<div class="row"><span>'+k+'</span><b>'+v+'</b></div>'; }
+function dbgStayHtml(r){
+  const h=r.happy;
+  return '<div class="sec">Group</div>'
+    +dbgRow('Rig',RIG_NAMES[r.rig])
+    +dbgRow('Budget','$'+r.budget)
+    +dbgRow('Site',(r.siteCls||'—')+' @ $'+r.sitePrice+'/night')
+    +'<div class="sec">Stay</div>'
+    +dbgRow('Nights planned',r.nightsPlanned)
+    +dbgRow('Nights stayed',r.nightsStayed)
+    +dbgRow('Total paid','$'+r.totalPaid)
+    +'<div class="sec">Happiness</div>'
+    +dbgRow('Base','+'+h.base)
+    +dbgRow('Picnic table','+'+h.table)
+    +dbgRow('Firepit tier','+'+h.firepit)
+    +dbgRow('Pool','+'+h.pool)
+    +dbgRow('Playground','+'+h.playground)
+    +dbgRow('Fishing dock','+'+h.dock)
+    +dbgRow('Final (clamped 1–5)',h.final)
+    +'<div class="sec">Checkout</div>'
+    +dbgRow('Stars','★'.repeat(r.stars)+' ('+r.stars+')')
+    +dbgRow('Tip','$'+r.tip)
+    +dbgRow('Camp rating',r.ratingBefore.toFixed(2)+' → '+r.ratingAfter.toFixed(2));
+}
+function dbgTurnHtml(e){
+  return '<div class="sec">Turned away (no stay)</div>'
+    +dbgRow('Rig',RIG_NAMES[e.rig])
+    +dbgRow('Budget','$'+e.budget)
+    +dbgRow('Reason',e.reason);
 }
 
 /* ---------------- input ---------------- */
@@ -689,6 +1031,7 @@ function bindInput(){
   },{passive:false});
   cv.addEventListener('contextmenu',e=>e.preventDefault());
   window.addEventListener('keydown',e=>{
+    if(typeof mgKey==='function'&&mgKey(e,true)) return;
     if(e.repeat) return;
     const k=e.key.toLowerCase();
     if(k==='m') toggleMute();
@@ -704,6 +1047,7 @@ function bindInput(){
     else if(k==='9') selectTool('bathroom');
     else if(k==='0') selectTool('bulldoze');
   });
+  window.addEventListener('keyup',e=>{ if(typeof mgKey==='function') mgKey(e,false); });
 }
 function toggleMute(){
   muted=!muted;
@@ -712,7 +1056,7 @@ function toggleMute(){
 }
 
 /* ---------------- toolbar ---------------- */
-const TOOL_IDS=['select','road','clear','tent','popup','medium','rv','pool','bathroom','store','playground','bulldoze'];
+const TOOL_IDS=['select','road','clear','tent','popup','medium','rv','pool','lake','bathroom','store','playground','dock','bulldoze'];
 function selectTool(id){
   currentTool=id;
   for(const t of TOOL_IDS) el('tool-'+t).className='tool'+(t===id?' on':'');
@@ -725,9 +1069,17 @@ function wireUI(){
     el('tool-'+t).addEventListener('click',()=>selectTool(t));
   el('spd0').addEventListener('click',()=>setSpeed(0));
   el('spd1').addEventListener('click',()=>setSpeed(1));
-  el('spd2').addEventListener('click',()=>setSpeed(2));
+  el('spd2').addEventListener('click',()=>setSpeed(5.4));
   el('muteBtn').addEventListener('click',toggleMute);
+  el('dbgBtn').addEventListener('click',()=>{ toggleDebug(); sClick(); });
+  el('dbgPrev').addEventListener('click',()=>{ dbgIdx--; renderDbg(); sClick(); });
+  el('dbgNext').addEventListener('click',()=>{ dbgIdx++; renderDbg(); sClick(); });
+  el('dbgClose').addEventListener('click',()=>{ closeDbg(); sClick(); });
+  el('rotBtn').addEventListener('click',rotateCam);
+  restartBtnEl=el('restartBtn');
+  restartBtnEl.addEventListener('click',tapRestart);
   el('panelClose').addEventListener('click',closePanel);
+  el('panel').addEventListener('click',guardPanelTap,true); // capture: kill tap-through on fresh open
   el('pPriceDown').addEventListener('click',()=>panelAction('priceDown'));
   el('pPriceUp').addEventListener('click',()=>panelAction('priceUp'));
   el('pTableBtn').addEventListener('click',()=>panelAction('table'));
@@ -743,6 +1095,18 @@ function frame(t){
   let dt=Math.min(0.25, now-(lastT||now));
   lastT=now;
   frameNo++;
+  if(restartBtnEl&&restartBtnEl.textContent==='SURE?'&&performance.now()-restartArmedAt>=3000){
+    restartArmedAt=-1e9; restartBtnEl.textContent='↺';
+  }
+  saveAcc+=dt;
+  if(saveAcc>=5){ saveAcc=0; saveGame(); }
+  if(typeof mgTick==='function') mgTick(now);
+  if(typeof MG!=='undefined'&&MG.active){
+    // a camper-help minigame owns the screen; the main sim stays paused.
+    // (the game may end itself mid-frame, so re-check before rendering)
+    const mg=MG.active; mg.frame(dt, now);
+    if(MG.active&&MG.renderer) MG.renderer.render(MG.active.scene, MG.active.camera);
+  } else {
   if(S.speed>0&&dt>0){
     acc+=dt*S.speed;
     let n=0;
@@ -756,8 +1120,24 @@ function frame(t){
   syncVisuals(dt, now);
   if(frameNo%15===0) updateHUD();
   renderer.render(scene,camera);
+  }
 }
 function syncVisuals(dt, now){
+  // day/night lighting
+  const lt=lightingFor(S.dayT/CYCLE_LEN);
+  const dark=1-lt.dayness;
+  if(sunLight){ sunLight.color.setHex(lt.sunColor); sunLight.intensity=lt.sunI; }
+  if(hemiLight) hemiLight.intensity=lt.hemiI;
+  if(bgCol) bgCol.setHex(lt.sky);
+  if(scene.fog) scene.fog.color.setHex(lt.fog);
+  for(const [id,e] of glowSprites){
+    // campfire glow only when someone is at the site; the store always glows faintly
+    const st=structById(S,id);
+    const lit=!st||st.kind!=='site'||st.guestId>=0;
+    const fl=0.72+0.20*Math.sin(now*9+e.phase)+0.08*Math.sin(now*23+e.phase*2.7);
+    e.sprite.material.opacity=lit?dark*e.base*fl:0;
+  }
+  if(stars) stars.material.opacity=dark*0.9;
   // vehicles
   const seen=new Set();
   for(const g of S.guests){
@@ -772,7 +1152,9 @@ function syncVisuals(dt, now){
     if(g.path.length>1){
       const a=g.path[Math.min(g.seg,g.path.length-1)], b=g.path[Math.min(g.seg+1,g.path.length-1)];
       const dx=b.x-a.x, dy=b.y-a.y;
-      if(dx||dy) vg.rotation.y=Math.atan2(dx,dy)-Math.PI/2;
+      // models face +x except pickup/trailer combos (built facing -x): flip those half a turn
+      const flip=(g.rig===RIG_POPUP||g.rig===RIG_MEDIUM)?Math.PI:0;
+      if(dx||dy) vg.rotation.y=Math.atan2(dx,dy)-Math.PI/2+flip;
     }
   }
   for(const [id,vg] of vehicleGroups){
@@ -783,10 +1165,13 @@ function syncVisuals(dt, now){
     q.position.x+=q.userData.speed*dt;
     if(q.position.x>wx(q.userData.x)+0.7) q.position.x=wx(q.userData.x)-0.7;
   }
-  // fire flicker
+  // fire flicker (flame visible only while the site is occupied)
   for(let i=0;i<fireMeshes.length;i++){
     const f=fireMeshes[i];
-    f.scale.y=1+0.25*Math.sin(now*13+i*1.7);
+    const st=structById(S,f.id);
+    const lit=st&&st.kind==='site'&&st.guestId>=0;
+    f.m.visible=lit;
+    if(lit) f.m.scale.y=1+0.25*Math.sin(now*13+i*1.7);
   }
   // people bob
   for(const [,pg] of peopleGroups){
@@ -794,6 +1179,16 @@ function syncVisuals(dt, now){
       p.position.y=0.02*Math.abs(Math.sin(now*2.2+p.userData.phase));
       p.rotation.y=Math.sin(now*0.7+p.userData.phase)*0.6;
     }
+  }
+  // building signs bob
+  for(const [,sg] of signSprites)
+    sg.sprite.position.y=sg.baseY+0.12*Math.sin(now*2+sg.phase);
+  // rising payment popups
+  for(let i=floaters.length-1;i>=0;i--){
+    const f=floaters[i]; f.life+=dt;
+    f.sp.position.y+=dt*1.5;
+    f.sp.material.opacity=1-f.life/f.ttl;
+    if(f.life>=f.ttl){ scene.remove(f.sp); floaters.splice(i,1); }
   }
 }
 
@@ -806,21 +1201,31 @@ function startSeed(seed){
 }
 function boot(){
   bootThree();
-  S=newGame((Date.now()%100000)|0);
+  S=loadGame()||newGame((Date.now()%100000)|0);
   rebuildWorld();
   wireUI();
   bindInput();
   updateHUD();
   selectTool('select');
+  window.addEventListener('pagehide',saveGame);
+  document.addEventListener('visibilitychange',()=>{ if(document.hidden) saveGame(); });
   requestAnimationFrame(frame);
 }
 boot();
 
 /* test hooks (harmless in browser) */
 window.CampTest={
-  selectTool, tapTile, setSpeed, openPanel, closePanel, panelAction,
-  startSeed, screenToTile, toggleMute,
+  selectTool, tapTile, setSpeed, openPanel, closePanel, panelAction, updateGhost,
+  startSeed, screenToTile, toggleMute, toggleDebug, rotateCam, tapRestart,
+  dbgNext:()=>{ dbgIdx++; renderDbg(); }, dbgPrev:()=>{ dbgIdx--; renderDbg(); }, closeDbg,
+  _dbgPush:dbgPush,
+  saveNow:saveGame, reloadSave,
   get S(){ return S; },
   get tool(){ return currentTool; },
   get panel(){ return curPanel; },
+  get camRot(){ return camRot; },
+  get debugMode(){ return debugMode; },
+  get dbgQueue(){ return dbgQueue; },
+  get dbgIdx(){ return dbgIdx; },
+  get restartArmed(){ return performance.now()-restartArmedAt<3000; },
 };

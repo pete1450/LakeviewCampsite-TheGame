@@ -13,8 +13,9 @@ const RIG_NAMES = ['tent campers', 'popup campers', 'medium trailer', 'big RV'];
 const ENTRANCE_X = 18;          // entrance road column
 const ENTRANCE_TOP = 31;        // northernmost entrance tile (y=31..35, south edge)
 
-const DAY_LEN = 45;             // seconds per day at 1x
-const START_MONEY = 12000;
+const DAY_PART = 45;            // daylight seconds per cycle at 1x (pacing unchanged)
+const CYCLE_LEN = 60;           // full day/night cycle seconds at 1x
+const START_MONEY = 1000;
 const MAX_GUESTS = 20;
 const VEH_SPEED = 0.6;           // tiles per second at 1x
 
@@ -29,10 +30,18 @@ const BUILD_DEFS = {
   store:      { name:'Camp store', w:3, h:2, cost:1400 },
   playground: { name:'Playground', w:2, h:2, cost:750  },
 };
-const POOL_DEF = { name:'Pool', w:2, h:2, cost:900, expandCost:700 };
+const POOL_DEF = { name:'Pool', w:2, h:2, cost:900 };
+// pool upgrade levels: footprint, cost to reach, effective radius
+const POOL_LEVELS = [
+  {w:2,h:2,cost:0,   r:5},
+  {w:3,h:3,cost:700, r:7},
+  {w:4,h:4,cost:1200,r:10},
+];
+function poolRadius(st){ const L=POOL_LEVELS[st.level|0]; return L?L.r:5; }
 const COST = {
   roadDirt: 15, roadGravel: 20, roadAsphalt: 35,
-  clearTree: 25, table: 60, firepit: [0, 25, 70, 160],
+  clearTree: 25, table: 120, firepit: [0, 25, 70, 160],
+  lake: 30,
 };
 const BUDGETS = [[20,40],[35,60],[55,90],[80,140]]; // [min,max] per rig class
 const ROAD_NAMES = ['','dirt','gravel','asphalt'];
@@ -40,15 +49,50 @@ const ROAD_NAMES = ['','dirt','gravel','asphalt'];
 /* ---------------- RNG ---------------- */
 function makeRng(seed){
   let a = seed >>> 0;
-  return function(){
+  const r = function(){
     a |= 0; a = a + 0x6D2B79F5 | 0;
     let t = Math.imul(a ^ a >>> 15, 1 | a);
     t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
+  r.get = ()=>a>>>0;   // expose internal state for save/load
+  r.set = v=>{ a = v>>>0; };
+  return r;
 }
 const ri = (r,a,b)=>a+Math.floor(r()*(b-a+1));
 const pick = (r,arr)=>arr[Math.floor(r()*arr.length)];
+
+/* ---------------- day/night lighting (pure, node-testable) ---------------- */
+// Cycle fractions: day 0..0.75, dusk 0.75..0.82, night 0.82..0.93, dawn 0.93..1.
+// The day rolls over at f=1, right as morning fades in after night.
+const F_DAY_END=0.75, F_DUSK_END=0.82, F_NIGHT_END=0.93;
+const smooth01=t=>{ t=t<0?0:t>1?1:t; return t*t*(3-2*t); };
+function lerpHex(a,b,t){
+  const ar=(a>>16)&255, ag=(a>>8)&255, ab=a&255;
+  const br=(b>>16)&255, bg=(b>>8)&255, bb=b&255;
+  return (Math.round(ar+(br-ar)*t)<<16)|(Math.round(ag+(bg-ag)*t)<<8)|Math.round(ab+(bb-ab)*t);
+}
+function lightingFor(f){
+  f=((f%1)+1)%1;
+  let dayness, duskGlow=0;
+  if(f<F_DAY_END) dayness=1;
+  else if(f<F_DUSK_END){
+    const t=smooth01((f-F_DAY_END)/(F_DUSK_END-F_DAY_END));
+    dayness=1-t; duskGlow=Math.sin(Math.PI*(f-F_DAY_END)/(F_DUSK_END-F_DAY_END));
+  }
+  else if(f<F_NIGHT_END) dayness=0;
+  else{
+    const t=smooth01((f-F_NIGHT_END)/(1-F_NIGHT_END));
+    dayness=t; duskGlow=Math.sin(Math.PI*(f-F_NIGHT_END)/(1-F_NIGHT_END));
+  }
+  const sunI=0.22+0.63*dayness;
+  const hemiI=0.28+0.67*dayness;
+  let sunColor=lerpHex(0x8fa8d8,0xfff2d8,dayness);
+  sunColor=lerpHex(sunColor,0xff8a3a,duskGlow*0.55);   // warm horizon at dusk/dawn
+  let sky=lerpHex(0x0c1330,0x87b5e0,dayness);
+  sky=lerpHex(sky,0x4a2a55,duskGlow*0.3);
+  return {dayness,sunI,sunColor,hemiI,sky,fog:sky};
+}
 
 /* ---------------- map ---------------- */
 const idx = (x,y)=>y*W+x;
@@ -98,7 +142,7 @@ function genMap(seed){
 function newGame(seed){
   const map = genMap(seed);
   const s = {
-    seed, money: START_MONEY, day: 1, dayT: 8/24*DAY_LEN, // start at 8am
+    seed, money: START_MONEY, day: 1, dayT: 8/24*CYCLE_LEN, // start at 8am
     speed: 1,
     terrain: map.terrain,
     road: new Uint8Array(W*H),
@@ -185,23 +229,27 @@ function bfsPath(s,parent,fromK,toK){
   path.reverse();
   return path;
 }
-function hasPool(s){ return s.structures.some(st=>st.kind==='pool'); }
-function hasPlayground(s){ return s.structures.some(st=>st.kind==='playground'); }
-function bathroomNear(s,x,y,w,h){
+// distance from a footprint's center to the closest point of a structure footprint
+function nearStruct(s,kind,x,y,w,h,radius){
   for(const st of s.structures){
-    if(st.kind!=='bathroom') continue;
+    if(st.kind!==kind) continue;
+    const r=typeof radius==='function'?radius(st):radius;
     const cx=Math.max(st.x,Math.min(x+w/2,st.x+st.w)), cy=Math.max(st.y,Math.min(y+h/2,st.y+st.h));
     const dx=cx-(x+w/2), dy=cy-(y+h/2);
-    if(Math.hypot(dx,dy)<=8) return true;
+    if(Math.hypot(dx,dy)<=r) return true;
   }
   return false;
 }
+const PLAY_R=10, BATH_R=8;
+function poolNear(s,x,y,w,h){ return nearStruct(s,'pool',x,y,w,h,poolRadius); }
+function playgroundNear(s,x,y,w,h){ return nearStruct(s,'playground',x,y,w,h,PLAY_R); }
+function bathroomNear(s,x,y,w,h){ return nearStruct(s,'bathroom',x,y,w,h,BATH_R); }
 function siteAppeal(s,st,rig){
   let a=1;
   if(st.table) a+=1;
   a+=st.firepit;               // tier 0..3
-  if(hasPool(s)) a+=2;
-  if(hasPlayground(s)&&rig<=RIG_POPUP) a+=1;
+  if(poolNear(s,st.x,st.y,st.w,st.h)) a+=2;
+  if(playgroundNear(s,st.x,st.y,st.w,st.h)&&rig<=RIG_POPUP) a+=1;
   if(bathroomNear(s,st.x,st.y,st.w,st.h)) a+=1;
   const adj=adjRoadTiles(s,st.x,st.y,st.w,st.h);
   if(adj.some(t=>s.road[idx(t.x,t.y)]===R_ASPHALT)) a+=1;
@@ -245,6 +293,17 @@ function clearTree(s,x,y){
   spend(s,COST.clearTree); s.terrain[k]=T_GRASS;
   return {ok:true,cost:COST.clearTree,msg:'Tree cleared'};
 }
+function digLake(s,x,y){
+  if(!inB(x,y)) return {ok:false,msg:'Out of bounds'};
+  const k=idx(x,y);
+  if(s.terrain[k]===T_WATER) return {ok:false,msg:'Already water'};
+  if(s.terrain[k]===T_TREE)  return {ok:false,msg:'Clear trees first ($25)'};
+  if(s.road[k]!==R_NONE)     return {ok:false,msg:'Tile has a road'};
+  if(s.tileStruct[k]>=0)     return {ok:false,msg:'Tile occupied'};
+  const n=need(s,COST.lake); if(n) return n;
+  spend(s,COST.lake); s.terrain[k]=T_WATER;
+  return {ok:true,cost:COST.lake,msg:'Lake dug'};
+}
 function addStruct(s,st){
   st.id=s.nextStructId++;
   for(let dy=0;dy<st.h;dy++)for(let dx=0;dx<st.w;dx++)
@@ -278,31 +337,92 @@ function placePool(s,x,y){
   if(!adjacentToRoad(s,x,y,POOL_DEF.w,POOL_DEF.h)) return {ok:false,msg:'Pool needs road access'};
   const n=need(s,POOL_DEF.cost); if(n) return n;
   spend(s,POOL_DEF.cost);
-  const st=addStruct(s,{kind:'pool',x,y,w:POOL_DEF.w,h:POOL_DEF.h,expanded:false,invested:POOL_DEF.cost});
+  const st=addStruct(s,{kind:'pool',x,y,w:POOL_DEF.w,h:POOL_DEF.h,level:0,invested:POOL_DEF.cost});
   return {ok:true,cost:POOL_DEF.cost,id:st.id,msg:'Pool built'};
 }
 function expandPool(s,id){
   const st=structById(s,id);
   if(!st||st.kind!=='pool') return {ok:false,msg:'No pool here'};
-  if(st.expanded) return {ok:false,msg:'Pool already expanded'};
-  // new ring must be clear
-  for(let dy=0;dy<3;dy++)for(let dx=0;dx<3;dx++){
-    if(dx<2&&dy<2) continue;
-    const tx=st.x+dx, ty=st.y+dy;
-    if(!inB(tx,ty)) return {ok:false,msg:'No room to expand'};
-    const k=idx(tx,ty);
-    if(s.terrain[k]!==T_GRASS||s.road[k]!==R_NONE||s.tileStruct[k]>=0)
-      return {ok:false,msg:'No room to expand'};
+  const lv=st.level|0;
+  if(lv>=POOL_LEVELS.length-1) return {ok:false,msg:'Pool fully expanded'};
+  const nw=POOL_LEVELS[lv+1].w, nh=POOL_LEVELS[lv+1].h;
+  // try growing in each direction: the new footprint adds one column and one
+  // row, so try right/bottom, left/bottom, right/top, left/top in turn
+  for(const d of [{dx:0,dy:0},{dx:-1,dy:0},{dx:0,dy:-1},{dx:-1,dy:-1}]){
+    const nx=st.x+d.dx, ny=st.y+d.dy;
+    let clear=true;
+    for(let ty=ny;ty<ny+nh&&clear;ty++)for(let tx=nx;tx<nx+nw&&clear;tx++){
+      if(tx>=st.x&&tx<st.x+st.w&&ty>=st.y&&ty<st.y+st.h) continue; // already ours
+      if(!inB(tx,ty)){ clear=false; break; }
+      const k=idx(tx,ty);
+      if(s.terrain[k]!==T_GRASS||s.road[k]!==R_NONE||s.tileStruct[k]>=0) clear=false;
+    }
+    if(!clear) continue;
+    const cost=POOL_LEVELS[lv+1].cost;
+    const n=need(s,cost); if(n) return n;
+    spend(s,cost);
+    st.invested+=cost; st.level=lv+1; st.x=nx; st.y=ny; st.w=nw; st.h=nh;
+    for(let ty=ny;ty<ny+nh;ty++)for(let tx=nx;tx<nx+nw;tx++)
+      s.tileStruct[idx(tx,ty)]=st.id;
+    return {ok:true,cost,msg:lv===0?'Pool expanded':'Pool fully expanded'};
   }
-  const n=need(s,POOL_DEF.expandCost); if(n) return n;
-  spend(s,POOL_DEF.expandCost);
-  st.invested+=POOL_DEF.expandCost; st.expanded=true; st.w=3; st.h=3;
-  for(let dy=0;dy<3;dy++)for(let dx=0;dx<3;dx++)
-    s.tileStruct[idx(st.x+dx,st.y+dy)]=st.id;
-  return {ok:true,cost:POOL_DEF.expandCost,msg:'Pool expanded'};
+  return {ok:false,msg:'No room to expand'};
 }
-function roadRefund(tier){
-  // half of cumulative build cost
+/* ---------------- fishing dock ---------------- */
+const DOCK_DEF={name:'Fishing dock',w:2,h:2,cost:1000};
+// dock upgrade levels: cost to reach, effective radius
+const DOCK_LEVELS=[
+  {cost:0,   r:7},
+  {cost:1500,r:9},
+  {cost:2000,r:11},
+];
+function dockRadius(st){ const L=DOCK_LEVELS[st.level|0]; return L?L.r:7; }
+function tileAdjRoad(s,x,y){
+  return [[1,0],[-1,0],[0,1],[0,-1]].some(([dx,dy])=>{
+    const tx=x+dx, ty=y+dy;
+    return inB(tx,ty)&&s.road[idx(tx,ty)]!==R_NONE;
+  });
+}
+function dockSpotOk(s,x,y){
+  const w=DOCK_DEF.w, h=DOCK_DEF.h;
+  for(let dy=0;dy<h;dy++)for(let dx=0;dx<w;dx++){
+    const tx=x+dx, ty=y+dy;
+    if(!inB(tx,ty)) return {ok:false,msg:'Out of bounds'};
+    const k=idx(tx,ty);
+    if(s.terrain[k]!==T_WATER) return {ok:false,msg:'Dock must go on water'};
+    if(s.tileStruct[k]>=0) return {ok:false,msg:'Tile occupied'};
+  }
+  // needs neighboring land (grass) that touches a road
+  for(let dy=-1;dy<=h;dy++)for(let dx=-1;dx<=w;dx++){
+    if(dx>=0&&dx<w&&dy>=0&&dy<h) continue;
+    const tx=x+dx, ty=y+dy;
+    if(!inB(tx,ty)) continue;
+    const k=idx(tx,ty);
+    if(s.terrain[k]===T_GRASS&&s.road[k]===R_NONE&&tileAdjRoad(s,tx,ty))
+      return {ok:true};
+  }
+  return {ok:false,msg:'Dock needs land with road access nearby'};
+}
+function placeDock(s,x,y){
+  const c=dockSpotOk(s,x,y); if(!c.ok) return c;
+  const n=need(s,DOCK_DEF.cost); if(n) return n;
+  spend(s,DOCK_DEF.cost);
+  const st=addStruct(s,{kind:'dock',x,y,w:DOCK_DEF.w,h:DOCK_DEF.h,level:0,invested:DOCK_DEF.cost});
+  return {ok:true,cost:DOCK_DEF.cost,id:st.id,msg:'Fishing dock built'};
+}
+function upgradeDock(s,id){
+  const st=structById(s,id);
+  if(!st||st.kind!=='dock') return {ok:false,msg:'No dock here'};
+  const lv=st.level|0;
+  if(lv>=DOCK_LEVELS.length-1) return {ok:false,msg:'Dock fully upgraded'};
+  const cost=DOCK_LEVELS[lv+1].cost;
+  const n=need(s,cost); if(n) return n;
+  spend(s,cost);
+  st.invested+=cost; st.level=lv+1;
+  return {ok:true,cost,msg:lv===0?'Row boats added':'Jetskis added'};
+}
+function dockNear(s,x,y,w,h){ return nearStruct(s,'dock',x,y,w,h,dockRadius); }
+function roadRefund(tier){  // half of cumulative build cost
   return tier===R_DIRT?7 : tier===R_GRAVEL?17 : 35;
 }
 function bulldoze(s,x,y){
@@ -317,6 +437,10 @@ function bulldoze(s,x,y){
   const id=s.tileStruct[k];
   if(id<0){
     if(s.terrain[k]===T_TREE) return {ok:false,msg:'Use the clear tool on trees'};
+    if(s.terrain[k]===T_WATER){
+      s.terrain[k]=T_GRASS; // fill a lake back in: free, no refund
+      return {ok:true,refund:0,msg:'Lake filled'};
+    }
     return {ok:false,msg:'Nothing to bulldoze'};
   }
   const st=structById(s,id);
@@ -389,7 +513,8 @@ function spawnGuest(s,rig,events){
   const g={
     id:s.nextGuestId++, rig, budget,
     state:'arriving', path:[], seg:0, segT:0,
-    siteId:-1, nightsLeft:0, price:0, happiness:3, tip:0,
+    siteId:-1, nightsLeft:0, nightsPlanned:0, nightsStayed:0, totalPaid:0,
+    price:0, happiness:3, tip:0,
     px:ENTRANCE_X, py:H-1,
   };
   if(choice){
@@ -414,6 +539,7 @@ function arrive(s,g,events){
     if(st&&st.guestId<0){
       st.guestId=g.id; g.state='camped';
       g.nightsLeft=1+Math.floor(s.rng()*4);
+      g.nightsPlanned=g.nightsLeft; g.nightsStayed=0; g.totalPaid=0;
       g.price=st.price; g.px=g.px; g.py=g.py;
       s.stats.visitors++;
       events.push({t:'arrive',guestId:g.id,siteId:st.id,nights:g.nightsLeft});
@@ -433,24 +559,51 @@ function arrive(s,g,events){
   }
   // no site: sad drive-through
   s.stats.turnedAway++;
-  events.push({t:'turnedAway',rig:g.rig});
+  const {visited:tv}=bfsRoads(s);
+  const reason=turnawayReason(s,g.rig,g.budget,tv);
+  events.push({t:'turnedAway',rig:g.rig,budget:g.budget,reason});
   g.state='departing';
   g.path=g.path.slice(0,g.seg+1).reverse();
   g.seg=0; g.segT=0;
 }
-function guestHappiness(s,g){
+function happinessParts(s,g){
   const st=structById(s,g.siteId);
-  let h=2;
-  if(st){ if(st.table)h+=1; h+=st.firepit; }
-  if(hasPool(s)) h+=1;
-  if(hasPlayground(s)&&g.rig<=RIG_POPUP) h+=1;
-  return Math.max(1,Math.min(5,h));
+  const p={base:2,table:0,firepit:0,pool:0,playground:0,dock:0};
+  if(st){
+    if(st.table)p.table=1; p.firepit=st.firepit;
+    if(poolNear(s,st.x,st.y,st.w,st.h)) p.pool=1;
+    if(playgroundNear(s,st.x,st.y,st.w,st.h)&&g.rig<=RIG_POPUP) p.playground=1;
+    if(dockNear(s,st.x,st.y,st.w,st.h)) p.dock=1;
+  }
+  p.final=Math.max(1,Math.min(5,p.base+p.table+p.firepit+p.pool+p.playground+p.dock));
+  return p;
+}
+function guestHappiness(s,g){ return happinessParts(s,g).final; }
+// why a drive-through found no site (for the debug report)
+function turnawayReason(s,rig,budget,visited){
+  let vacant=0, fits=0, afford=0, reach=0;
+  for(const st of s.structures){
+    if(st.kind!=='site'||st.guestId>=0) continue;
+    vacant++;
+    const def=SITE_CLASSES.find(c=>c.id===st.cls);
+    if(def.cap<rig) continue;
+    fits++;
+    if(st.price>budget) continue;
+    afford++;
+    if(adjRoadTiles(s,st.x,st.y,st.w,st.h).some(t=>visited[idx(t.x,t.y)])) reach++;
+  }
+  if(!vacant) return 'no vacant sites';
+  if(!fits) return 'no vacant site fits this rig';
+  if(!afford) return 'no fitting site within budget';
+  if(!reach) return 'no affordable site reachable by road';
+  return 'no eligible site';
 }
 function depart(s,g,events){
   const st=structById(s,g.siteId);
   const siteId=st?st.id:-1;
   if(st&&st.guestId===g.id) st.guestId=-1;
   const stars=Math.max(1,Math.min(5,Math.round(g.happiness)));
+  const ratingBefore=s.rating;
   s.rating=(s.rating*s.ratingN+stars)/(s.ratingN+1);
   s.ratingN++;
   const tip=g.happiness>=4?(g.happiness-3)*15:0;
@@ -461,7 +614,15 @@ function depart(s,g,events){
   const startK=idx(Math.round(g.px),Math.round(g.py));
   g.path=bfsPath(s,parent,startK,idx(ENTRANCE_X,H-1))||[{x:ENTRANCE_X,y:H-1}];
   g.seg=0; g.segT=0;
-  events.push({t:'depart',guestId:g.id,siteId,stars,tip});
+  const def=st?SITE_CLASSES.find(c=>c.id===st.cls):null;
+  events.push({t:'depart',guestId:g.id,siteId,stars,tip,
+    report:{
+      rig:g.rig, budget:g.budget,
+      siteCls:def?def.name:null, sitePrice:g.price,
+      nightsPlanned:g.nightsPlanned, nightsStayed:g.nightsStayed, totalPaid:g.totalPaid,
+      happy:happinessParts(s,g), stars, tip,
+      ratingBefore, ratingAfter:s.rating,
+    }});
 }
 function midnight(s,events){
   s.day++;
@@ -469,6 +630,7 @@ function midnight(s,events){
   const camped=s.guests.filter(g=>g.state==='camped');
   for(const g of camped){
     s.money+=g.price; s.stats.earned+=g.price;
+    g.totalPaid+=g.price; g.nightsStayed++;
     g.happiness=guestHappiness(s,g);
     g.nightsLeft--;
     events.push({t:'paid',guestId:g.id,amount:g.price,nightsLeft:g.nightsLeft});
@@ -476,7 +638,7 @@ function midnight(s,events){
   }
   const stores=s.structures.filter(st=>st.kind==='store').length;
   if(stores>0&&camped.length>0){
-    const rev=4*camped.length*stores;
+    const rev=8*camped.length*stores;
     s.money+=rev; s.stats.earned+=rev;
     events.push({t:'storeRev',amount:rev});
   }
@@ -517,18 +679,58 @@ function tickSim(s,dt){
     }
   }
   s.guests=s.guests.filter(g=>!g.gone);
-  if(s.dayT>=DAY_LEN){ s.dayT-=DAY_LEN; midnight(s,events); }
+  if(s.dayT>=CYCLE_LEN){ s.dayT-=CYCLE_LEN; midnight(s,events); }
   return events;
+}
+
+/* ---------------- persistence (pure JSON; game.js handles localStorage) ---------------- */
+const SAVE_VERSION=1;
+function saveState(s){
+  return JSON.stringify({
+    v:SAVE_VERSION, seed:s.seed, money:s.money, day:s.day, dayT:s.dayT, speed:s.speed,
+    terrain:Array.from(s.terrain), road:Array.from(s.road), roadLocked:Array.from(s.roadLocked),
+    structures:s.structures, guests:s.guests,
+    nextStructId:s.nextStructId, nextGuestId:s.nextGuestId,
+    rating:s.rating, ratingN:s.ratingN, spawnT:s.spawnT,
+    rngState:s.rng.get(), stats:s.stats,
+  });
+}
+function loadState(json){
+  const d=JSON.parse(json);
+  if(!d||d.v!==SAVE_VERSION||!Array.isArray(d.terrain)||d.terrain.length!==W*H)
+    throw new Error('bad save');
+  const s={
+    seed:d.seed, money:d.money, day:d.day, dayT:d.dayT, speed:d.speed,
+    terrain:Uint8Array.from(d.terrain), road:Uint8Array.from(d.road),
+    roadLocked:Uint8Array.from(d.roadLocked),
+    structures:d.structures, nextStructId:d.nextStructId,
+    tileStruct:new Int16Array(W*H).fill(-1),
+    guests:d.guests, nextGuestId:d.nextGuestId,
+    rating:d.rating, ratingN:d.ratingN, spawnT:d.spawnT,
+    rng:makeRng(0), stats:d.stats,
+  };
+  s.rng.set(d.rngState);
+  for(const st of s.structures){
+    // migrate pre-tier saves: expanded pools become level 1
+    if(st.kind==='pool'&&st.level==null) st.level=st.expanded?1:0;
+    if(st.kind==='dock'&&st.level==null) st.level=0;
+    for(let dy=0;dy<st.h;dy++)for(let dx=0;dx<st.w;dx++)
+      s.tileStruct[idx(st.x+dx,st.y+dy)]=st.id;
+  }
+  return s;
 }
 
 /* ---------------- exports (node) ---------------- */
 if(typeof module!=='undefined'&&module.exports){
   module.exports={W,H,T_GRASS,T_WATER,T_TREE,R_NONE,R_DIRT,R_GRAVEL,R_ASPHALT,
     RIG_TENT,RIG_POPUP,RIG_MEDIUM,RIG_RV,RIG_NAMES,ENTRANCE_X,ENTRANCE_TOP,
-    DAY_LEN,START_MONEY,MAX_GUESTS,VEH_SPEED,SITE_CLASSES,BUILD_DEFS,POOL_DEF,
+    DAY_PART,CYCLE_LEN,START_MONEY,MAX_GUESTS,VEH_SPEED,SITE_CLASSES,BUILD_DEFS,POOL_DEF,
     COST,BUDGETS,makeRng,genMap,newGame,idx,inB,tileAt,roadAt,structAt,structById,
-    footprintClear,adjacentToRoad,adjRoadTiles,bfsRoads,bfsPath,hasPool,hasPlayground,
-    siteAppeal,occupiedCount,buildRoad,clearTree,placeSite,placeBuilding,placePool,
-    expandPool,bulldoze,setSitePrice,buyTable,buyFirepit,spawnInterval,chooseSite,
-    spawnGuest,forceSpawn,arrive,depart,midnight,tickSim};
+    footprintClear,adjacentToRoad,adjRoadTiles,bfsRoads,bfsPath,
+    nearStruct,poolNear,playgroundNear,bathroomNear,dockNear,poolRadius,dockRadius,
+    POOL_LEVELS,DOCK_DEF,DOCK_LEVELS,dockSpotOk,tileAdjRoad,
+    siteAppeal,occupiedCount,buildRoad,clearTree,digLake,placeSite,placeBuilding,placePool,
+    expandPool,placeDock,upgradeDock,bulldoze,setSitePrice,buyTable,buyFirepit,spawnInterval,chooseSite,
+    spawnGuest,forceSpawn,arrive,depart,midnight,tickSim,lightingFor,saveState,loadState,
+    happinessParts,turnawayReason,guestHappiness};
 }

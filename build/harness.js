@@ -6,15 +6,28 @@ const path = __dirname + '/';
 // ---------- DOM stub ----------
 function mkEl(){
   const el = { style:{}, _l:{}, _tc:'', className:'', disabled:false,
-    addEventListener(t,f){ this._l[t]=f; }, appendChild(){}, removeChild(){} };
+    addEventListener(t,f){ this._l[t]=f; }, removeEventListener(){}, appendChild(){}, removeChild(){} };
   Object.defineProperty(el, 'textContent', { get(){ return this._tc; }, set(v){ this._tc = String(v); } });
   return el;
+}
+function mkCanvas(){
+  return { width:0, height:0, style:{}, _l:{},
+    addEventListener(t,f){ this._l[t]=f; }, removeEventListener(){},
+    getContext: ()=>({ createRadialGradient: ()=>({addColorStop(){}}), fillRect(){}, fillStyle:'',
+      fillText(){}, strokeText(){}, font:'', textAlign:'', textBaseline:'', lineWidth:1, strokeStyle:'' }) };
 }
 const els = {};
 global.document = {
   getElementById: id => els[id] || (els[id] = mkEl()),
-  createElement: () => mkEl(),
+  createElement: (tag) => tag==='canvas' ? mkCanvas() : mkEl(),
   addEventListener(){}, readyState: 'complete', hidden: false,
+  body: mkEl(),
+};
+global.localStorage = {
+  _d:{},
+  getItem(k){ return Object.prototype.hasOwnProperty.call(this._d,k) ? this._d[k] : null; },
+  setItem(k,v){ this._d[k]=String(v); },
+  removeItem(k){ delete this._d[k]; },
 };
 global.window = { innerWidth: 1280, innerHeight: 800, addEventListener(){},
   AudioContext: undefined, webkitAudioContext: undefined };
@@ -40,6 +53,7 @@ class V2 {
 class Color {
   constructor(h){ this.h=h||0; }
   setHex(h){ this.h=h; return this; }
+  setRGB(r,g,b){ this.h=((r*255)<<16)|((g*255)<<8)|(b*255); return this; }
   getHex(){ return this.h||0; }
   copy(c){ this.h=c.h; return this; }
   offsetHSL(){ return this; }
@@ -67,7 +81,7 @@ class Obj {
 }
 class Mesh extends Obj { constructor(g,m){ super(); this.geometry=g||{dispose(){}}; this.material=m||new Mat(); } }
 class Group extends Obj {}
-class Geo { constructor(){ } dispose(){} }
+class Geo { constructor(){ } dispose(){} rotateX(){return this;} rotateY(){return this;} rotateZ(){return this;} }
 class InstancedMesh extends Obj {
   constructor(g,m,count){ super(); this.geometry=g; this.material=m; this.count=count;
     this.instanceMatrix={needsUpdate:false}; this.instanceColor=null; }
@@ -79,26 +93,53 @@ class Raycaster {
   constructor(){ this.ray={ intersectPlane:()=>null }; }
 }
 class Plane { constructor(){} }
+class BufferGeometry { constructor(){} setAttribute(){} dispose(){} }
+class BufferAttribute { constructor(arr,n){ this.array=arr; this.itemSize=n; } }
+class Points extends Obj { constructor(g,m){ super(); this.geometry=g; this.material=m||new Mat(); } }
+class Sprite extends Obj { constructor(m){ super(); this.material=m||new Mat(); } }
+class CanvasTexture { constructor(){} }
+class Fog { constructor(c){ this.color=new Color(c); } }
+class Light extends Obj { constructor(c,i){ super(); this.color=new Color(c); this.intensity=i; } }
 global.THREE = {
   WebGLRenderer: class { constructor(){} setPixelRatio(){} setSize(){} render(){} },
   Scene: class extends Group {},
   OrthographicCamera: class extends Obj { updateProjectionMatrix(){} },
   PerspectiveCamera: class extends Obj { updateProjectionMatrix(){} },
-  HemisphereLight: class extends Obj {},
-  DirectionalLight: class extends Obj {},
+  HemisphereLight: Light,
+  DirectionalLight: Light,
+  PointLight: Light,
   Mesh, Group, MeshLambertMaterial: Mat, MeshBasicMaterial: Mat,
-  BoxGeometry: Geo, PlaneGeometry: Geo, Color, Vector2: V2, Vector3: V3,
+  PointsMaterial: Mat, SpriteMaterial: Mat,
+  BoxGeometry: Geo, PlaneGeometry: Geo, CircleGeometry: Geo, RingGeometry: Geo,
+  ConeGeometry: Geo, TorusGeometry: Geo, CylinderGeometry: Geo, SphereGeometry: Geo,
+  Color, Vector2: V2, Vector3: V3,
   Raycaster, Plane, InstancedMesh, Object3D: Obj,
+  BufferGeometry, BufferAttribute, Points, Sprite, CanvasTexture, Fog,
+  AdditiveBlending: 2,
 };
 
 // ---------- load game ----------
-const src = fs.readFileSync(path+'logic.js','utf8') + '\n' + fs.readFileSync(path+'game.js','utf8');
+const src = fs.readFileSync(path+'logic.js','utf8') + '\n' + fs.readFileSync(path+'game.js','utf8')
+  + '\n' + fs.readFileSync(path+'minigames.js','utf8');
 eval(src + `
-;Object.assign(globalThis,{forceSpawn,setSitePrice,buildRoad,placeSite,placeBuilding,placePool,
-  expandPool,buyTable,buyFirepit,structById,footprintClear,adjacentToRoad,structAt,occupiedCount,
-  tickSim,idx,inB,T_GRASS,T_TREE,T_WATER,R_NONE,R_DIRT,R_GRAVEL,R_ASPHALT,RIG_TENT,DAY_LEN,
+;Object.assign(globalThis,{forceSpawn,setSitePrice,buildRoad,placeSite,placeBuilding,placePool,digLake,
+  expandPool,placeDock,upgradeDock,dockNear,dockRadius,poolRadius,dockSpotOk,poolNear,
+  buyTable,buyFirepit,structById,footprintClear,adjacentToRoad,structAt,occupiedCount,
+  tickSim,idx,inB,T_GRASS,T_TREE,T_WATER,R_NONE,R_DIRT,R_GRAVEL,R_ASPHALT,RIG_TENT,RIG_POPUP,RIG_MEDIUM,RIG_RV,CYCLE_LEN,DAY_PART,
+  lightingFor,saveState,loadState,
   CampTest: window.CampTest,
-  get vehicleGroups(){return vehicleGroups;}, get structGroups(){return structGroups;}});
+  get vehicleGroups(){return vehicleGroups;}, get structGroups(){return structGroups;},
+  MallowLogic, ShoesLogic, TrailerLogic, mallowColor,
+  MALLOW_COOK_RATE, MALLOW_TARGET,
+  SHOE_MAX_OFF, SHOE_RING_R, SHOE_TRIES,
+  TRAILER_TIME, TRAILER_REV, TRAILER_FWD, TRAILER_HITCH_L, TRAILER_WIN_D,
+  get MG(){ return MG; }, mgStart, mgQuit, mgEnd, mgTick});
+;Object.defineProperty(globalThis,'fireMeshes',{configurable:true,get:function(){return fireMeshes;}});
+;Object.defineProperty(globalThis,'glowSprites',{configurable:true,get:function(){return glowSprites;}});
+;Object.defineProperty(globalThis,'signSprites',{configurable:true,get:function(){return signSprites;}});
+;Object.defineProperty(globalThis,'floaters',{configurable:true,get:function(){return floaters;}});
+;Object.defineProperty(globalThis,'shimmerQuads',{configurable:true,get:function(){return shimmerQuads;}});
+;Object.defineProperty(globalThis,'radiusGroup',{configurable:true,get:function(){return radiusGroup;}});
 ;Object.defineProperty(globalThis,'simNow',{configurable:true,get:function(){return simNow;},set:function(v){simNow=v;}});
 ;Object.defineProperty(globalThis,'rafCb',{configurable:true,get:function(){return rafCb;}});
 `);
