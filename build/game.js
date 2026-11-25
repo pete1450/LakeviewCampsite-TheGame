@@ -310,6 +310,14 @@ function makeTextSprite(text,size){
 function syncSigns(st){
   const old=signSprites.get(st.id);
   if(old){ scene.remove(old.sprite); signSprites.delete(st.id); }
+  if(st.kind==='site'&&st.repair){
+    const cx=wx(st.x)+(st.w-1)/2, cz=wz(st.y)+(st.h-1)/2;
+    const sp=makeTextSprite('🔧',1.5);
+    sp.position.set(cx,2.3,cz);
+    scene.add(sp);
+    signSprites.set(st.id,{sprite:sp,baseY:2.3,phase:st.id*2.13});
+    return;
+  }
   if(st.kind!=='bathroom'&&st.kind!=='store') return;
   const cx=wx(st.x)+(st.w-1)/2, cz=wz(st.y)+(st.h-1)/2;
   const sp=makeTextSprite(st.kind==='bathroom'?'🚻':'🏪',1.5);
@@ -750,6 +758,8 @@ function renderPanel(){
   const body=el('panelBody');
   const show=(id,v)=>{ el(id).style.display=v?'block':'none'; };
   show('priceRow',false); show('pTableBtn',false); show('pFireBtn',false); show('pExpandBtn',false);
+  show('pRepairBtn',false); show('pRefurbBtn',false);
+  show('pWaterBtn',false); show('pElectricBtn',false);
   if(st.kind==='site'){
     const def=SITE_CLASSES.find(c=>c.id===st.cls);
     el('panelTitle').textContent='⛺ '+def.name;
@@ -758,7 +768,11 @@ function renderPanel(){
       const g=S.guests.find(v=>v.id===st.guestId);
       if(g) ginfo=RIG_NAMES[g.rig]+' • '+g.nightsLeft+' night'+(g.nightsLeft===1?'':'s')+' left\nHappiness '+'★'.repeat(g.happiness);
     }
-    body.textContent=def.w+'x'+def.h+' site • fits: '+rigsFor(def.cap)+'\n'+ginfo;
+    const cond=st.cond==null?100:st.cond;
+    let wear='Condition: '+cond+'%';
+    if(st.repair) wear+=' • 🔧 '+(st.repair==='major'?'MAJOR':'minor')+' repair needed — cannot rent';
+    else if(cond<50) wear+=' • ⚠️ worn — repair chance doubled';
+    body.textContent=def.w+'x'+def.h+' site • fits: '+rigsFor(def.cap)+'\n'+ginfo+'\n'+wear;
     body.style.whiteSpace='pre-line';
     show('priceRow',true);
     el('pPriceVal').textContent='$'+st.price;
@@ -772,6 +786,35 @@ function renderPanel(){
       'Firepit: '+FIRE_NAMES[st.firepit]+' → '+['','dirt ($25)','wheel ring ($70)','fancy stone ($160)'][nt];
     fb.disabled=st.firepit>=3||S.money<COST.firepit[nt];
     show('pFireBtn',true);
+    if(st.repair){
+      const rb=el('pRepairBtn');
+      rb.textContent='🔧 Fix '+(st.repair==='major'?'MAJOR':'minor')+' repair ($'+REPAIR_COST[st.repair]+')';
+      rb.disabled=S.money<REPAIR_COST[st.repair];
+      show('pRepairBtn',true);
+    }
+    if(cond<100){
+      const ub=el('pRefurbBtn');
+      if(st.repair){
+        ub.textContent='✨ Refurbish — repair first';
+        ub.disabled=true;
+      }else{
+        const rc=refurbishCost(st);
+        ub.textContent='✨ Refurbish to 100% ($'+rc+')';
+        ub.disabled=S.money<rc;
+      }
+      show('pRefurbBtn',true);
+    }
+    for(const k of ['water','electric']){
+      const hb=el(k==='water'?'pWaterBtn':'pElectricBtn'), h=HOOKUP[k];
+      if(st[k]){
+        hb.textContent=S.utilOff?h.emoji+' '+h.name+' \u2014 SHUT OFF':'\u2713 '+h.name+' (+'+h.appeal+' appeal)';
+        hb.disabled=true;
+      }else{
+        hb.textContent=h.emoji+' '+h.name+' ($'+h.install+', +'+h.appeal+' appeal)';
+        hb.disabled=S.money<h.install;
+      }
+      show(k==='water'?'pWaterBtn':'pElectricBtn',true);
+    }
   }else if(st.kind==='pool'){
     const plv=st.level|0;
     el('panelTitle').textContent='🏊 Pool';
@@ -816,13 +859,18 @@ function panelAction(act){
   else if(act==='priceDown') r=setSitePrice(S,st.id,st.price-5);
   else if(act==='table') r=buyTable(S,st.id);
   else if(act==='fire') r=buyFirepit(S,st.id);
+  else if(act==='repair'){ r=repairSite(S,st.id); if(r.ok) syncStructure(st); }
+  else if(act==='refurbish'){ r=refurbishSite(S,st.id); if(r.ok) syncStructure(st); }
+  else if(act==='water') r=buyHookup(S,st.id,'water');
+  else if(act==='electric') r=buyHookup(S,st.id,'electric');
   else if(act==='expand'){
     r=(st.kind==='dock')?upgradeDock(S,st.id):expandPool(S,st.id);
     if(r.ok) syncStructure(st);
   }
   if(!r) return false;
   if(r.ok!==false||act==='priceUp'||act==='priceDown'){
-    if(act==='table'||act==='fire'){ syncStructure(st); sUpgrade(); }
+    if(act==='table'||act==='fire'||act==='repair'||act==='refurbish'){ syncStructure(st); sUpgrade(); }
+    else if(act==='water'||act==='electric'){ sUpgrade(); }
     else if(act==='priceUp'||act==='priceDown'){ sClick(); }
     else if(act==='expand'){ sUpgrade(); }
     if(r.msg) toast(r.msg);
@@ -841,6 +889,23 @@ function updateHUD(){
   el('stars').textContent=S.rating.toFixed(1);
   for(const [id,v] of [['spd0',0],['spd1',1],['spd2',5.4]])
     el(id).className='sbtn'+(S.speed===v?' on':'');
+  // utility bill button: shows while a bill is owed
+  const bb=el('billBtn');
+  if(S.utilBill){
+    const left=S.utilBill.dueDay-S.day;
+    bb.style.display='block';
+    bb.textContent='💡 Bill $'+S.utilBill.amount+(S.utilOff?' — SHUT OFF':(left>0?' ('+left+'d left)':' (due today)'));
+    bb.className=S.utilOff||left<=1?'urgent':'';
+    bb.disabled=S.money<S.utilBill.amount;
+  }else{
+    bb.style.display='none';
+  }
+}
+function payBill(){
+  const r=payUtilBill(S);
+  if(r.ok){ sCash(); toast(r.msg); }
+  else { sError(); toast(r.msg); }
+  updateHUD(); renderPanel();
 }
 function setSpeed(v){
   S.speed=v; updateHUD(); sClick();
@@ -905,6 +970,20 @@ function drainEvents(evs){
       if(debugMode&&e.report) dbgPush(dbgStayHtml(e.report));
     }
     else if(e.t==='midnight'){ sChime(); }
+    else if(e.t==='repairNeeded'){
+      const st=structById(S,e.siteId);
+      if(st) syncStructure(st); // shows the 🔧 sign
+      toast('🔧 Site needs a '+(e.kind==='major'?'MAJOR':'minor')+' repair — it can\'t take guests until fixed');
+      sError();
+    }
+    else if(e.t==='utilBill'){
+      toast('💡 Utility bill: $'+e.amount+' — pay within 5 days or the hookups shut off');
+      sChime();
+    }
+    else if(e.t==='utilOff'){
+      toast('⚠️ Utilities SHUT OFF! Hookups now hurt appeal — pay the bill to restore them');
+      sError();
+    }
     else if(e.t==='storeRev'){ /* cash sound already via paid */ }
   }
   if(evs.length) updateHUD();
@@ -967,7 +1046,9 @@ function dbgStayHtml(r){
     +'<div class="sec">Checkout</div>'
     +dbgRow('Stars','★'.repeat(r.stars)+' ('+r.stars+')')
     +dbgRow('Tip','$'+r.tip)
-    +dbgRow('Camp rating',r.ratingBefore.toFixed(2)+' → '+r.ratingAfter.toFixed(2));
+    +dbgRow('Camp rating',r.ratingBefore.toFixed(2)+' → '+r.ratingAfter.toFixed(2))
+    +(r.siteCond!=null?dbgRow('Site condition after stay',r.siteCond+'%'):'')
+    +(r.repairNeeded?dbgRow('Repair needed','🔧 '+(r.repairNeeded==='major'?'MAJOR':'minor')):'');
 }
 function dbgTurnHtml(e){
   return '<div class="sec">Turned away (no stay)</div>'
@@ -1084,6 +1165,11 @@ function wireUI(){
   el('pPriceUp').addEventListener('click',()=>panelAction('priceUp'));
   el('pTableBtn').addEventListener('click',()=>panelAction('table'));
   el('pFireBtn').addEventListener('click',()=>panelAction('fire'));
+  el('pRepairBtn').addEventListener('click',()=>panelAction('repair'));
+  el('pRefurbBtn').addEventListener('click',()=>panelAction('refurbish'));
+  el('pWaterBtn').addEventListener('click',()=>panelAction('water'));
+  el('pElectricBtn').addEventListener('click',()=>panelAction('electric'));
+  el('billBtn').addEventListener('click',payBill);
   el('pExpandBtn').addEventListener('click',()=>panelAction('expand'));
 }
 
@@ -1215,7 +1301,7 @@ boot();
 
 /* test hooks (harmless in browser) */
 window.CampTest={
-  selectTool, tapTile, setSpeed, openPanel, closePanel, panelAction, updateGhost,
+  selectTool, tapTile, setSpeed, openPanel, closePanel, panelAction, updateGhost, syncStructure, payBill,
   startSeed, screenToTile, toggleMute, toggleDebug, rotateCam, tapRestart,
   dbgNext:()=>{ dbgIdx++; renderDbg(); }, dbgPrev:()=>{ dbgIdx--; renderDbg(); }, closeDbg,
   _dbgPush:dbgPush,

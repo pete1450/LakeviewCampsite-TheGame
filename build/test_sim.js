@@ -56,6 +56,65 @@ assert(!flameVacant.m.visible,'fire unlit while the site is vacant');
 CT.panelAction('priceDown'); CT.panelAction('priceDown'); CT.panelAction('priceDown');
 eq(CT.S.structures.find(s=>s.id===siteId).price, 10, 'price lowered to $10');
 
+// --- site wear: panel, repair/refurbish buttons, wrench sign ---
+const wst=CT.S.structures.find(s=>s.id===siteId);
+wst.cond=47; wst.repair='minor';
+CT.syncStructure(wst);
+assert(globalThis.signSprites.has(siteId),'wrench sign shows over a site needing repair');
+CT.tapTile(16,32); // open panel
+assert(document.getElementById('panelBody').textContent.includes('Condition: 47%'),'panel shows condition');
+assert(document.getElementById('panelBody').textContent.includes('minor repair needed'),'panel names the repair');
+eq(document.getElementById('pRepairBtn').style.display,'block','repair button shows when repair needed');
+eq(document.getElementById('pRefurbBtn').style.display,'block','refurbish button shows below 100%');
+eq(document.getElementById('pRefurbBtn').disabled,true,'refurbish disabled while repair needed');
+const mWear=CT.S.money;
+assert(CT.panelAction('repair'),'repair action works');
+eq(wst.repair,null,'repair cleared');
+eq(CT.S.money,mWear-50,'minor repair costs $50');
+assert(!globalThis.signSprites.has(siteId),'wrench sign gone after repair');
+CT.tapTile(16,32);
+eq(document.getElementById('pRefurbBtn').disabled,false,'refurbish enabled after repair');
+const mRef=CT.S.money;
+assert(CT.panelAction('refurbish'),'refurbish action works');
+eq(wst.cond,100,'refurbished to 100%');
+eq(CT.S.money,mRef-106,'refurbish 47% costs $106');
+
+// --- utilities: install via panel, bill button, shutoff ---
+const ust=CT.S.structures.find(s=>s.id===siteId);
+CT.S.money+=2000; // test top-up: installs + bills + later building tests
+CT.tapTile(16,32);
+eq(document.getElementById('pWaterBtn').style.display,'block','water button shows');
+eq(document.getElementById('pElectricBtn').style.display,'block','electric button shows');
+const mU=CT.S.money;
+assert(CT.panelAction('water'),'install water via panel');
+eq(ust.water,true,'water installed');
+eq(CT.S.money,mU-150,'water install $150');
+assert(CT.panelAction('electric'),'install electric via panel');
+eq(ust.electric,true,'electric installed');
+eq(CT.S.money,mU-150-200,'electric install $200');
+eq(siteAppeal(CT.S,ust,RIG_TENT),5,'both hookups add +2 appeal (1 base + table + firepit + 2)');
+// bill appears at the midnight starting day 7
+CT.S.day=6; CT.S.dayT=CYCLE_LEN-0.2;
+frames(60); // crosses midnight
+eq(CT.S.day,7,'day 7 after midnight');
+eq(document.getElementById('billBtn').style.display,'block','bill button appears');
+assert(document.getElementById('billBtn').textContent.includes('$25'),'bill button shows $25');
+// pay it
+const mB=CT.S.money;
+CT.payBill();
+eq(CT.S.money,mB-25,'bill paid');
+eq(document.getElementById('billBtn').style.display,'none','bill button hides after payment');
+// let a bill go unpaid past due: shutoff flips appeal
+CT.S.day=6; CT.S.dayT=CYCLE_LEN-0.2; frames(60); // day 7, new bill
+eq(CT.S.utilOff,false,'not shut off yet');
+for(let d=0;d<6;d++){ CT.S.dayT=CYCLE_LEN-0.2; frames(60); } // days 8..13
+eq(CT.S.day,13,'day 13');
+eq(CT.S.utilOff,true,'shut off after 5 days unpaid');
+eq(siteAppeal(CT.S,ust,RIG_TENT),1,'appeal flipped while shut off (1+1+1-2)');
+CT.payBill();
+eq(CT.S.utilOff,false,'paying late restores utilities');
+eq(siteAppeal(CT.S,ust,RIG_TENT),5,'appeal restored after payment');
+
 // --- panel tap-through guard: the tap that opens the panel must not press a button under it ---
 CT.tapTile(16,32); // re-open panel (fresh timestamp)
 const panelClickH = document.getElementById('panel')._l.click;

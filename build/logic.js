@@ -43,6 +43,31 @@ const COST = {
   clearTree: 25, table: 120, firepit: [0, 25, 70, 160],
   lake: 30,
 };
+// site wear: numbers picked for the first implementation (see design notes —
+// the doc specifies the 3%/6% chances and the doubling below 50%, the rest
+// is tunable): -5% condition per completed stay, minor repair $50, major
+// repair $150, refurbish $2 per missing condition point.
+const WEAR_PER_STAY = 5;
+const REPAIR_COST = { minor: 50, major: 150 };
+const REFURBISH_PER_POINT = 2;
+// utilities: numbers picked for the first implementation (design notes leave
+// them open): a month is 7 game days; water install $150 / $10 per site per
+// month; electric install $200 / $15 per site per month; each hookup +1
+// appeal while paid, -1 while shut off.
+const UTIL_MONTH_DAYS = 7;
+const HOOKUP = {
+  water:    { install: 150, monthly: 10, appeal: 1, name: 'Water hookup',    emoji: '💧' },
+  electric: { install: 200, monthly: 15, appeal: 1, name: 'Electric hookup', emoji: '⚡' },
+};
+// pure: what repair (if any) does one checkout roll produce?
+// r in [0,1); below 50% condition the chances double (3%->6%, 6%->12%).
+function rollRepair(r, cond){
+  const major = cond < 50 ? 0.12 : 0.06, minor = cond < 50 ? 0.06 : 0.03;
+  if (r < major) return 'major';
+  if (r < major + minor) return 'minor';
+  return null;
+}
+function refurbishCost(st){ return (100 - (st.cond == null ? 100 : st.cond)) * REFURBISH_PER_POINT; }
 const BUDGETS = [[20,40],[35,60],[55,90],[80,140]]; // [min,max] per rig class
 const ROAD_NAMES = ['','dirt','gravel','asphalt'];
 
@@ -152,6 +177,7 @@ function newGame(seed){
     guests: [], nextGuestId: 1,
     rating: 3.0, ratingN: 0,
     spawnT: 6,
+    utilBill: null, utilOff: false, // {amount, dueDay} while a utility bill is owed
     rng: makeRng(seed^0x9e3779b9),
     stats: { earned:0, spent:0, visitors:0, turnedAway:0 },
   };
@@ -248,6 +274,8 @@ function siteAppeal(s,st,rig){
   let a=1;
   if(st.table) a+=1;
   a+=st.firepit;               // tier 0..3
+  for(const k of ['water','electric'])
+    if(st[k]) a+=(s.utilOff?-HOOKUP[k].appeal:HOOKUP[k].appeal); // shut off flips the bonus
   if(poolNear(s,st.x,st.y,st.w,st.h)) a+=2;
   if(playgroundNear(s,st.x,st.y,st.w,st.h)&&rig<=RIG_POPUP) a+=1;
   if(bathroomNear(s,st.x,st.y,st.w,st.h)) a+=1;
@@ -319,7 +347,8 @@ function placeSite(s,clsId,x,y){
   const n=need(s,def.cost); if(n) return n;
   spend(s,def.cost);
   const st=addStruct(s,{kind:'site',cls:clsId,cap:def.cap,x,y,w:def.w,h:def.h,
-    price:def.defPrice,table:false,firepit:0,guestId:-1,invested:def.cost});
+    price:def.defPrice,table:false,firepit:0,guestId:-1,invested:def.cost,
+    cond:100,repair:null,water:false,electric:false});
   return {ok:true,cost:def.cost,id:st.id,msg:def.name+' placed'};
 }
 function placeBuilding(s,kind,x,y){
@@ -466,6 +495,33 @@ function buyTable(s,id){
   spend(s,COST.table); st.table=true; st.invested+=COST.table;
   return {ok:true,cost:COST.table,msg:'Picnic table added'};
 }
+function buyHookup(s,id,kind){
+  const h=HOOKUP[kind];
+  const st=structById(s,id);
+  if(!h) return {ok:false,msg:'Unknown hookup'};
+  if(!st||st.kind!=='site') return {ok:false,msg:'No site here'};
+  if(st[kind]) return {ok:false,msg:'Already has '+h.name.toLowerCase()};
+  const n=need(s,h.install); if(n) return n;
+  spend(s,h.install); st[kind]=true; st.invested+=h.install;
+  return {ok:true,cost:h.install,msg:h.name+' installed ($'+h.install+')'};
+}
+function monthlyUtilCost(s){
+  let total=0;
+  for(const st of s.structures){
+    if(st.kind!=='site') continue;
+    if(st.water) total+=HOOKUP.water.monthly;
+    if(st.electric) total+=HOOKUP.electric.monthly;
+  }
+  return total;
+}
+function payUtilBill(s){
+  if(!s.utilBill) return {ok:false,msg:'No bill to pay'};
+  const n=need(s,s.utilBill.amount); if(n) return n;
+  const amount=s.utilBill.amount;
+  spend(s,amount);
+  s.utilBill=null; s.utilOff=false;
+  return {ok:true,cost:amount,msg:'Utility bill paid ($'+amount+') — hookups back on'};
+}
 function buyFirepit(s,id){
   const st=structById(s,id);
   if(!st||st.kind!=='site') return {ok:false,msg:'No site here'};
@@ -489,7 +545,7 @@ function spawnInterval(s){ return Math.max(3.5, Math.min(16, 16 - s.rating*2.2))
 function chooseSite(s,rig,budget,visited){
   let best=null, bestScore=-1, bestTarget=null;
   for(const st of s.structures){
-    if(st.kind!=='site'||st.guestId>=0) continue;
+    if(st.kind!=='site'||st.guestId>=0||st.repair) continue;
     const def=SITE_CLASSES.find(c=>c.id===st.cls);
     if(def.cap<rig) continue;
     if(st.price>budget) continue;
@@ -583,7 +639,7 @@ function guestHappiness(s,g){ return happinessParts(s,g).final; }
 function turnawayReason(s,rig,budget,visited){
   let vacant=0, fits=0, afford=0, reach=0;
   for(const st of s.structures){
-    if(st.kind!=='site'||st.guestId>=0) continue;
+    if(st.kind!=='site'||st.guestId>=0||st.repair) continue;
     vacant++;
     const def=SITE_CLASSES.find(c=>c.id===st.cls);
     if(def.cap<rig) continue;
@@ -602,6 +658,20 @@ function depart(s,g,events){
   const st=structById(s,g.siteId);
   const siteId=st?st.id:-1;
   if(st&&st.guestId===g.id) st.guestId=-1;
+  // wear: the stay costs the site condition, then the checkout repair roll
+  // (rolled against the new, lower condition, so worn sites break more)
+  let repairNow=null;
+  if(st){
+    if(st.cond==null) st.cond=100;
+    st.cond=Math.max(0,st.cond-WEAR_PER_STAY);
+    if(!st.repair){
+      st.repair=rollRepair(s.rng(),st.cond);
+      if(st.repair){
+        repairNow=st.repair;
+        events.push({t:'repairNeeded',siteId:st.id,kind:st.repair,cond:st.cond});
+      }
+    }
+  }
   const stars=Math.max(1,Math.min(5,Math.round(g.happiness)));
   const ratingBefore=s.rating;
   s.rating=(s.rating*s.ratingN+stars)/(s.ratingN+1);
@@ -622,11 +692,48 @@ function depart(s,g,events){
       nightsPlanned:g.nightsPlanned, nightsStayed:g.nightsStayed, totalPaid:g.totalPaid,
       happy:happinessParts(s,g), stars, tip,
       ratingBefore, ratingAfter:s.rating,
+      siteCond:st?st.cond:null, repairNeeded:repairNow,
     }});
+}
+function repairSite(s,siteId){
+  const st=structById(s,siteId);
+  if(!st||st.kind!=='site') return {ok:false,msg:'Not a site'};
+  if(!st.repair) return {ok:false,msg:'No repair needed'};
+  const cost=REPAIR_COST[st.repair];
+  const n=need(s,cost); if(n) return n;
+  spend(s,cost);
+  const kind=st.repair; st.repair=null;
+  return {ok:true,cost,msg:(kind==='major'?'Major':'Minor')+' repair fixed ($'+cost+')'};
+}
+function refurbishSite(s,siteId){
+  const st=structById(s,siteId);
+  if(!st||st.kind!=='site') return {ok:false,msg:'Not a site'};
+  if(st.repair) return {ok:false,msg:'Repair it first'};
+  if(st.cond==null) st.cond=100;
+  if(st.cond>=100) return {ok:false,msg:'Already at 100% condition'};
+  const cost=refurbishCost(st);
+  const n=need(s,cost); if(n) return n;
+  spend(s,cost);
+  st.cond=100;
+  return {ok:true,cost,msg:'Site refurbished to 100% ($'+cost+')'};
 }
 function midnight(s,events){
   s.day++;
   events.push({t:'midnight',day:s.day});
+  // monthly utility bill: every 7 days, if any site has a hookup
+  if(s.day % UTIL_MONTH_DAYS === 0){
+    const due=monthlyUtilCost(s);
+    if(due>0){
+      if(s.utilBill) s.utilBill.amount+=due; // unpaid bill grows; due date stays
+      else s.utilBill={amount:due,dueDay:s.day+5};
+      events.push({t:'utilBill',amount:s.utilBill.amount,dueDay:s.utilBill.dueDay});
+    }
+  }
+  // 5 days to pay: past the due day, the utilities go dark
+  if(s.utilBill&&s.day>s.utilBill.dueDay&&!s.utilOff){
+    s.utilOff=true;
+    events.push({t:'utilOff'});
+  }
   const camped=s.guests.filter(g=>g.state==='camped');
   for(const g of camped){
     s.money+=g.price; s.stats.earned+=g.price;
@@ -692,6 +799,7 @@ function saveState(s){
     structures:s.structures, guests:s.guests,
     nextStructId:s.nextStructId, nextGuestId:s.nextGuestId,
     rating:s.rating, ratingN:s.ratingN, spawnT:s.spawnT,
+    utilBill:s.utilBill||null, utilOff:!!s.utilOff,
     rngState:s.rng.get(), stats:s.stats,
   });
 }
@@ -707,6 +815,7 @@ function loadState(json){
     tileStruct:new Int16Array(W*H).fill(-1),
     guests:d.guests, nextGuestId:d.nextGuestId,
     rating:d.rating, ratingN:d.ratingN, spawnT:d.spawnT,
+    utilBill:d.utilBill||null, utilOff:!!d.utilOff,
     rng:makeRng(0), stats:d.stats,
   };
   s.rng.set(d.rngState);
@@ -714,6 +823,11 @@ function loadState(json){
     // migrate pre-tier saves: expanded pools become level 1
     if(st.kind==='pool'&&st.level==null) st.level=st.expanded?1:0;
     if(st.kind==='dock'&&st.level==null) st.level=0;
+    // migrate pre-wear saves: sites start at full condition, no repair
+    if(st.kind==='site'){
+      if(st.cond==null) st.cond=100; if(st.repair===undefined) st.repair=null;
+      if(st.water===undefined) st.water=false; if(st.electric===undefined) st.electric=false;
+    }
     for(let dy=0;dy<st.h;dy++)for(let dx=0;dx<st.w;dx++)
       s.tileStruct[idx(st.x+dx,st.y+dy)]=st.id;
   }
@@ -732,5 +846,7 @@ if(typeof module!=='undefined'&&module.exports){
     siteAppeal,occupiedCount,buildRoad,clearTree,digLake,placeSite,placeBuilding,placePool,
     expandPool,placeDock,upgradeDock,bulldoze,setSitePrice,buyTable,buyFirepit,spawnInterval,chooseSite,
     spawnGuest,forceSpawn,arrive,depart,midnight,tickSim,lightingFor,saveState,loadState,
-    happinessParts,turnawayReason,guestHappiness};
+    happinessParts,turnawayReason,guestHappiness,
+    WEAR_PER_STAY,REPAIR_COST,REFURBISH_PER_POINT,rollRepair,refurbishCost,repairSite,refurbishSite,
+    UTIL_MONTH_DAYS,HOOKUP,monthlyUtilCost,buyHookup,payUtilBill};
 }

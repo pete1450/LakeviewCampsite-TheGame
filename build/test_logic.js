@@ -597,4 +597,153 @@ function flatten(s,x,y,w,h){
   assert(L.spawnInterval(s)<L.spawnInterval(Object.assign({},s,{rating:1})),'higher rating -> faster spawns');
 }
 
+// ---------- site wear, repairs, refurbish ----------
+{
+  // rollRepair: pure chance table (3%/6% at 50%+, doubled below 50%)
+  eq(L.rollRepair(0.05,100),'major','5% roll at full condition = major');
+  eq(L.rollRepair(0.06,100),'minor','6% roll at full condition = minor');
+  eq(L.rollRepair(0.08,100),'minor','8% roll at full condition = minor');
+  eq(L.rollRepair(0.09,100),null,'9% roll at full condition = no repair');
+  eq(L.rollRepair(0.11,40),'major','11% roll below 50% = major (doubled)');
+  eq(L.rollRepair(0.15,40),'minor','15% roll below 50% = minor (doubled)');
+  eq(L.rollRepair(0.18,40),null,'18% roll below 50% = no repair');
+  eq(L.rollRepair(0.06,50),'minor','exactly 50% uses the normal table');
+  eq(L.rollRepair(0.11,49),'major','49% uses the doubled table');
+  // new sites start at 100%, no repair
+  const s=L.newGame(4243); s.money+=9000; s.spawnT=1e9;
+  L.buildRoad(s,17,33); L.buildRoad(s,17,32);
+  flatten(s,16,32,1,1);
+  const ps=L.placeSite(s,'tent',16,32); assert(ps.ok,'site for wear test');
+  const st=L.structById(s,ps.id);
+  eq(st.cond,100,'new site at 100% condition'); eq(st.repair,null,'new site needs no repair');
+  // a stay wears the site 5% at checkout
+  const g={id:99,siteId:st.id,rig:L.RIG_TENT,budget:40,price:25,happiness:4,px:17,py:33,nightsPlanned:2,nightsStayed:2,totalPaid:50};
+  st.guestId=99;
+  const evs=[]; L.depart(s,g,evs);
+  eq(st.cond,95,'one stay wears the site 5%');
+  eq(st.guestId,-1,'site freed at checkout');
+  assert(evs.some(e=>e.t==='depart'),'depart event fired');
+  // repair blocks renting: chooseSite skips it
+  st.repair='minor';
+  eq(L.chooseSite(s,L.RIG_TENT,40,L.bfsRoads(s).visited),null,'repair-needed site is not chosen');
+  // repair: minor $50, clears the flag, site rentable again
+  const mBefore=s.money;
+  const r1=L.repairSite(s,st.id);
+  assert(r1.ok&&r1.cost===50,'minor repair costs $50');
+  eq(s.money,mBefore-50,'repair deducts');
+  eq(st.repair,null,'repair cleared');
+  assert(L.chooseSite(s,L.RIG_TENT,40,L.bfsRoads(s).visited),'site rentable again after repair');
+  // refurbish: $2 per missing point
+  eq(L.refurbishCost(st),10,'95% -> $10 refurbish');
+  const m2=s.money;
+  const r2=L.refurbishSite(s,st.id);
+  assert(r2.ok&&r2.cost===10,'refurbish costs $10');
+  eq(st.cond,100,'refurbish restores 100%');
+  eq(s.money,m2-10,'refurbish deducts');
+  // refurbish at 100% fails; repair with nothing wrong fails
+  assert(!L.refurbishSite(s,st.id).ok,'refurbish at 100% fails');
+  assert(!L.repairSite(s,st.id).ok,'repair with nothing wrong fails');
+  // repair must come before refurbish
+  st.cond=60; st.repair='major';
+  const r3=L.refurbishSite(s,st.id);
+  assert(!r3.ok&&/Repair it first/.test(r3.msg),'refurbish blocked while repair needed');
+  const r4=L.repairSite(s,st.id);
+  assert(r4.ok&&r4.cost===150,'major repair costs $150');
+  const r5=L.refurbishSite(s,st.id);
+  assert(r5.ok&&r5.cost===80,'60% -> $80 refurbish after repair');
+  eq(st.cond,100,'refurbished after repair');
+  // broke = can't afford either
+  st.cond=50; s.money=10;
+  assert(!L.refurbishSite(s,st.id).ok,'refurbish fails when broke');
+  st.repair='minor'; s.money=10;
+  assert(!L.repairSite(s,st.id).ok,'repair fails when broke');
+  // old saves migrate: a site without cond/repair loads at 100%/null
+  const s2=L.newGame(7);
+  const saved=JSON.parse(L.saveState(s2));
+  saved.structures.push({kind:'site',cls:0,cap:0,x:16,y:32,w:1,h:1,price:25,table:false,firepit:0,guestId:-1,invested:120,id:900});
+  const loaded=L.loadState(JSON.stringify(saved));
+  const mig=loaded.structures.find(v=>v.id===900);
+  eq(mig.cond,100,'old save migrates to 100% condition'); eq(mig.repair,null,'old save migrates to no repair');
+}
+
+// ---------- utilities: hookups, monthly bill, shutoff ----------
+{
+  // install costs and flags
+  const s=L.newGame(4243); s.money+=9000; s.spawnT=1e9;
+  L.buildRoad(s,17,33); L.buildRoad(s,17,32);
+  flatten(s,16,32,1,1);
+  const ps=L.placeSite(s,'tent',16,32); assert(ps.ok,'site for hookup test');
+  const st=L.structById(s,ps.id);
+  eq(st.water,false,'new site has no water hookup'); eq(st.electric,false,'new site has no electric hookup');
+  eq(L.siteAppeal(s,st,L.RIG_TENT),1,'base appeal 1 (no bonuses)');
+  const m0=s.money;
+  const w1=L.buyHookup(s,st.id,'water');
+  assert(w1.ok&&w1.cost===150,'water install costs $150');
+  eq(s.money,m0-150,'water install deducts');
+  eq(st.water,true,'water flag set');
+  eq(L.siteAppeal(s,st,L.RIG_TENT),2,'water adds +1 appeal');
+  assert(!L.buyHookup(s,st.id,'water').ok,'second water install fails');
+  const e1=L.buyHookup(s,st.id,'electric');
+  assert(e1.ok&&e1.cost===200,'electric install costs $200');
+  eq(L.siteAppeal(s,st,L.RIG_TENT),3,'both hookups add +2 appeal');
+  eq(L.monthlyUtilCost(s),25,'monthly bill $10 water + $15 electric');
+  // broke = can't install
+  flatten(s,30,30,1,1); L.buildRoad(s,30,29);
+  const ps2=L.placeSite(s,'tent',30,30); assert(ps2.ok,'second site');
+  s.money=100;
+  assert(!L.buyHookup(s,ps2.id,'water').ok,'water install fails when broke');
+  s.money+=9000;
+  // billing: a month is 7 days; bill appears at the midnight starting day 7
+  s.day=6;
+  const evs=[]; L.midnight(s,evs);
+  eq(s.day,7,'midnight advanced to day 7');
+  assert(s.utilBill,'bill appears on day 7');
+  eq(s.utilBill.amount,25,'bill is the monthly total');
+  eq(s.utilBill.dueDay,12,'bill due 5 days later');
+  assert(evs.some(e=>e.t==='utilBill'),'utilBill event fired');
+  // no bill on a non-month day
+  const evs2=[]; L.midnight(s,evs2);
+  eq(s.day,8,'day 8');
+  assert(!evs2.some(e=>e.t==='utilBill'),'no second bill on day 8');
+  // paying clears it and restores
+  const mPay=s.money;
+  const pr=L.payUtilBill(s);
+  assert(pr.ok&&pr.cost===25,'bill pays $25');
+  eq(s.money,mPay-25,'payment deducts');
+  eq(s.utilBill,null,'bill cleared'); eq(s.utilOff,false,'not shut off');
+  assert(!L.payUtilBill(s).ok,'paying with no bill fails');
+  // unpaid 5 days -> shut off: appeal flips to negative
+  s.day=6; L.midnight(s,[]); // new bill, day 7, due day 12
+  assert(s.utilBill,'second bill appears');
+  for(let d=8;d<=12;d++) L.midnight(s,[]);
+  eq(s.day,12,'day 12: still on');
+  eq(s.utilOff,false,'not shut off on the due day');
+  const evs3=[]; L.midnight(s,evs3);
+  eq(s.day,13,'day 13: past due');
+  eq(s.utilOff,true,'shut off after 5 days unpaid');
+  assert(evs3.some(e=>e.t==='utilOff'),'utilOff event fired');
+  eq(L.siteAppeal(s,st,L.RIG_TENT),-1,'both hookups flip: base 1 - 2 = -1 appeal');
+  // next month adds to the outstanding bill; due date stays
+  s.day=13; L.midnight(s,[]); // day 14: month boundary
+  eq(s.utilBill.amount,50,'unpaid bill grows by the new month');
+  eq(s.utilBill.dueDay,12,'due date stays the original one');
+  // paying late restores instantly
+  const pr2=L.payUtilBill(s);
+  assert(pr2.ok&&pr2.cost===50,'late bill pays the grown amount');
+  eq(s.utilOff,false,'hookups back on after late payment');
+  eq(L.siteAppeal(s,st,L.RIG_TENT),3,'appeal restored');
+  // no hookups = no bill
+  const s3=L.newGame(11); s3.day=6;
+  L.midnight(s3,[]);
+  eq(s3.utilBill,null,'no bill when no sites have hookups');
+  // old saves migrate
+  const s4=L.newGame(7);
+  const saved=JSON.parse(L.saveState(s4));
+  saved.structures.push({kind:'site',cls:0,cap:0,x:16,y:32,w:1,h:1,price:25,table:false,firepit:0,guestId:-1,invested:120,cond:100,repair:null,id:901});
+  const loaded=L.loadState(JSON.stringify(saved));
+  const mig=loaded.structures.find(v=>v.id===901);
+  eq(mig.water,false,'old save migrates to no water'); eq(mig.electric,false,'old save migrates to no electric');
+  eq(loaded.utilBill,null,'old save migrates to no bill'); eq(loaded.utilOff,false,'old save migrates to not shut off');
+}
+
 console.log('logic OK — '+n+' asserts');
