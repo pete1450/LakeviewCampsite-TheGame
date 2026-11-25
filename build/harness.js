@@ -125,6 +125,8 @@ eval(src + `
 ;Object.assign(globalThis,{forceSpawn,setSitePrice,buildRoad,placeSite,placeBuilding,placePool,digLake,
   expandPool,placeDock,upgradeDock,dockNear,dockRadius,poolRadius,dockSpotOk,poolNear,
   buyTable,buyFirepit,structById,footprintClear,adjacentToRoad,structAt,occupiedCount,
+  repairSite,refurbishSite,refurbishCost,rollRepair,WEAR_PER_STAY,REPAIR_COST,REFURBISH_PER_POINT,
+  buyHookup,payUtilBill,monthlyUtilCost,HOOKUP,UTIL_MONTH_DAYS,siteAppeal,midnight,
   tickSim,idx,inB,T_GRASS,T_TREE,T_WATER,R_NONE,R_DIRT,R_GRAVEL,R_ASPHALT,RIG_TENT,RIG_POPUP,RIG_MEDIUM,RIG_RV,CYCLE_LEN,DAY_PART,
   lightingFor,saveState,loadState,
   CampTest: window.CampTest,

@@ -22,6 +22,11 @@
   #muteBtn,#dbgBtn{pointer-events:auto;background:rgba(10,25,10,.72);border:2px solid #d8f3c0;border-radius:10px;
     color:#fff;font-size:16px;width:44px;height:40px;cursor:pointer;}
   #dbgBtn.on{background:#3f7a2e;border-color:#fff;}
+  #billBtn{pointer-events:auto;background:#8a6d00;border:2px solid #ffd23f;border-radius:10px;
+    color:#fff;font-size:14px;font-weight:bold;height:40px;padding:0 10px;cursor:pointer;font-family:inherit;}
+  #billBtn.urgent{background:#a11;border-color:#ffb3b3;animation:billPulse 1s infinite;}
+  #billBtn:disabled{opacity:.55;cursor:default;animation:none;}
+  @keyframes billPulse{50%{transform:scale(1.06);}}
   #dbgOverlay{position:absolute;inset:0;background:rgba(0,0,0,.55);display:none;pointer-events:auto;z-index:20;}
   #dbgDialog{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:330px;max-width:88vw;
     max-height:82vh;display:flex;flex-direction:column;background:rgba(12,26,12,.97);
@@ -78,6 +83,7 @@
       <button class="sbtn" id="spd2" title="fast">⏩</button>
       <button id="muteBtn" title="mute">🔊</button>
       <button id="dbgBtn" title="debug: departure reports">🐛</button>
+      <button id="billBtn" style="display:none" title="pay the utility bill">💡 Bill $0</button>
     </div>
   </div>
   <div id="toolbar">
@@ -108,6 +114,10 @@
     </div>
     <button class="pbtn wide" id="pTableBtn" style="display:none">Add picnic table ($120)</button>
     <button class="pbtn wide" id="pFireBtn" style="display:none">Firepit: none</button>
+    <button class="pbtn wide" id="pRepairBtn" style="display:none">Fix repair</button>
+    <button class="pbtn wide" id="pRefurbBtn" style="display:none">Refurbish</button>
+    <button class="pbtn wide" id="pWaterBtn" style="display:none">Water hookup</button>
+    <button class="pbtn wide" id="pElectricBtn" style="display:none">Electric hookup</button>
     <button class="pbtn wide" id="pExpandBtn" style="display:none">Expand pool ($700)</button>
   </div>
   <div id="toast"></div>
