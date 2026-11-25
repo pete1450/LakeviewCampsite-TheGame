@@ -93,10 +93,10 @@ assert(CT.panelAction('electric'),'install electric via panel');
 eq(ust.electric,true,'electric installed');
 eq(CT.S.money,mU-150-200,'electric install $200');
 eq(siteAppeal(CT.S,ust,RIG_TENT),5,'both hookups add +2 appeal (1 base + table + firepit + 2)');
-// bill appears at the midnight starting day 7
-CT.S.day=6; CT.S.dayT=CYCLE_LEN-0.2;
+// bill appears at the midnight starting day 15
+CT.S.day=14; CT.S.dayT=CYCLE_LEN-0.2;
 frames(60); // crosses midnight
-eq(CT.S.day,7,'day 7 after midnight');
+eq(CT.S.day,15,'day 15 after midnight');
 eq(document.getElementById('billBtn').style.display,'block','bill button appears');
 assert(document.getElementById('billBtn').textContent.includes('$25'),'bill button shows $25');
 // pay it
@@ -105,10 +105,10 @@ CT.payBill();
 eq(CT.S.money,mB-25,'bill paid');
 eq(document.getElementById('billBtn').style.display,'none','bill button hides after payment');
 // let a bill go unpaid past due: shutoff flips appeal
-CT.S.day=6; CT.S.dayT=CYCLE_LEN-0.2; frames(60); // day 7, new bill
+CT.S.day=14; CT.S.dayT=CYCLE_LEN-0.2; frames(60); // day 15, new bill
 eq(CT.S.utilOff,false,'not shut off yet');
-for(let d=0;d<6;d++){ CT.S.dayT=CYCLE_LEN-0.2; frames(60); } // days 8..13
-eq(CT.S.day,13,'day 13');
+for(let d=0;d<6;d++){ CT.S.dayT=CYCLE_LEN-0.2; frames(60); } // days 16..21
+eq(CT.S.day,21,'day 21');
 eq(CT.S.utilOff,true,'shut off after 5 days unpaid');
 eq(siteAppeal(CT.S,ust,RIG_TENT),1,'appeal flipped while shut off (1+1+1-2)');
 CT.payBill();

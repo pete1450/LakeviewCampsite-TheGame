@@ -693,18 +693,18 @@ function flatten(s,x,y,w,h){
   s.money=100;
   assert(!L.buyHookup(s,ps2.id,'water').ok,'water install fails when broke');
   s.money+=9000;
-  // billing: a month is 7 days; bill appears at the midnight starting day 7
-  s.day=6;
+  // billing: a month is 15 days; bill appears at the midnight starting day 15
+  s.day=14;
   const evs=[]; L.midnight(s,evs);
-  eq(s.day,7,'midnight advanced to day 7');
-  assert(s.utilBill,'bill appears on day 7');
+  eq(s.day,15,'midnight advanced to day 15');
+  assert(s.utilBill,'bill appears on day 15');
   eq(s.utilBill.amount,25,'bill is the monthly total');
-  eq(s.utilBill.dueDay,12,'bill due 5 days later');
+  eq(s.utilBill.dueDay,20,'bill due 5 days later');
   assert(evs.some(e=>e.t==='utilBill'),'utilBill event fired');
   // no bill on a non-month day
   const evs2=[]; L.midnight(s,evs2);
-  eq(s.day,8,'day 8');
-  assert(!evs2.some(e=>e.t==='utilBill'),'no second bill on day 8');
+  eq(s.day,16,'day 16');
+  assert(!evs2.some(e=>e.t==='utilBill'),'no second bill on day 16');
   // paying clears it and restores
   const mPay=s.money;
   const pr=L.payUtilBill(s);
@@ -713,27 +713,27 @@ function flatten(s,x,y,w,h){
   eq(s.utilBill,null,'bill cleared'); eq(s.utilOff,false,'not shut off');
   assert(!L.payUtilBill(s).ok,'paying with no bill fails');
   // unpaid 5 days -> shut off: appeal flips to negative
-  s.day=6; L.midnight(s,[]); // new bill, day 7, due day 12
+  s.day=14; L.midnight(s,[]); // new bill, day 15, due day 20
   assert(s.utilBill,'second bill appears');
-  for(let d=8;d<=12;d++) L.midnight(s,[]);
-  eq(s.day,12,'day 12: still on');
+  for(let d=16;d<=20;d++) L.midnight(s,[]);
+  eq(s.day,20,'day 20: still on');
   eq(s.utilOff,false,'not shut off on the due day');
   const evs3=[]; L.midnight(s,evs3);
-  eq(s.day,13,'day 13: past due');
+  eq(s.day,21,'day 21: past due');
   eq(s.utilOff,true,'shut off after 5 days unpaid');
   assert(evs3.some(e=>e.t==='utilOff'),'utilOff event fired');
   eq(L.siteAppeal(s,st,L.RIG_TENT),-1,'both hookups flip: base 1 - 2 = -1 appeal');
   // next month adds to the outstanding bill; due date stays
-  s.day=13; L.midnight(s,[]); // day 14: month boundary
+  s.day=29; L.midnight(s,[]); // day 30: month boundary
   eq(s.utilBill.amount,50,'unpaid bill grows by the new month');
-  eq(s.utilBill.dueDay,12,'due date stays the original one');
+  eq(s.utilBill.dueDay,20,'due date stays the original one');
   // paying late restores instantly
   const pr2=L.payUtilBill(s);
   assert(pr2.ok&&pr2.cost===50,'late bill pays the grown amount');
   eq(s.utilOff,false,'hookups back on after late payment');
   eq(L.siteAppeal(s,st,L.RIG_TENT),3,'appeal restored');
   // no hookups = no bill
-  const s3=L.newGame(11); s3.day=6;
+  const s3=L.newGame(11); s3.day=14;
   L.midnight(s3,[]);
   eq(s3.utilBill,null,'no bill when no sites have hookups');
   // old saves migrate
